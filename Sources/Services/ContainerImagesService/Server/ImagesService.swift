@@ -79,7 +79,14 @@ public actor ImagesService {
         return try await imageStore.list().map { $0.description.fromCZ }
     }
 
-    public func pull(reference: String, platform: Platform?, insecure: Bool, progressUpdate: ProgressUpdateHandler?, maxConcurrentDownloads: Int = 3) async throws
+    public func pull(
+        reference: String,
+        platform: Platform?,
+        insecure: Bool,
+        progressUpdate: ProgressUpdateHandler?,
+        maxConcurrentDownloads: Int = 3,
+        registryCredentials: RegistryCredentials? = nil
+    ) async throws
         -> ImageDescription
     {
         self.log.debug(
@@ -103,7 +110,7 @@ public actor ImagesService {
             )
         }
 
-        let img = try await Self.withAuthentication(ref: reference) { auth in
+        let img = try await Self.withAuthentication(ref: reference, credentials: registryCredentials) { auth in
             try await self.imageStore.pull(
                 reference: reference, platform: platform, insecure: insecure, auth: auth, progress: ContainerizationProgressAdapter.handler(from: progressUpdate),
                 maxConcurrentDownloads: maxConcurrentDownloads)
@@ -430,8 +437,13 @@ extension ImagesService {
 
 extension ImagesService {
     private static func withAuthentication<T>(
-        ref: String, _ body: @Sendable @escaping (_ auth: Authentication?) async throws -> T?
+        ref: String,
+        credentials: RegistryCredentials? = nil,
+        _ body: @Sendable @escaping (_ auth: Authentication?) async throws -> T?
     ) async throws -> T? {
+        if let credentials {
+            return try await body(BasicAuthentication(username: credentials.username, password: credentials.password))
+        }
         var authentication: Authentication?
         let ref = try Reference.parse(ref)
         guard let host = ref.resolvedDomain else {

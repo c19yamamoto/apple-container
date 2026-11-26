@@ -257,7 +257,8 @@ extension ClientImage {
         scheme: RequestScheme = .https,
         containerSystemConfig: ContainerSystemConfig,
         progressUpdate: ProgressUpdateHandler? = nil,
-        maxConcurrentDownloads: Int = 3
+        maxConcurrentDownloads: Int = 3,
+        registryCredentials: RegistryCredentials? = nil
     ) async throws -> ClientImage {
         guard maxConcurrentDownloads > 0 else {
             throw ContainerizationError(.invalidArgument, message: "maximum number of concurrent downloads must be greater than 0, got \(maxConcurrentDownloads)")
@@ -273,6 +274,9 @@ extension ClientImage {
 
         request.set(key: .imageReference, value: reference)
         try request.set(platform: platform)
+        if let registryCredentials {
+            request.set(key: .registryCredentials, value: try JSONEncoder().encode(registryCredentials))
+        }
 
         let insecure = try scheme.schemeFor(host: host, internalDnsDomain: containerSystemConfig.dns.domain) == .http
         request.set(key: .insecureFlag, value: insecure)

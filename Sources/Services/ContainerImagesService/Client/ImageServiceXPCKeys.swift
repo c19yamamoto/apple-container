@@ -37,6 +37,8 @@ public enum ImagesServiceXPCKeys: String {
     case insecureFlag
     case garbageCollect
     case maxConcurrentDownloads
+    /// pull ごとの認証情報を keychain 保存せずに渡す。
+    case registryCredentials
     case forceLoad
     case rejectedMembers
 

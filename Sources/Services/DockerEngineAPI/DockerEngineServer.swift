@@ -33,6 +33,7 @@ public struct DockerEngineServer: Sendable {
     private let socketPath: String
     private let containerSystemConfig: ContainerSystemConfig
     private let log: Logger
+    private let runtimeState = DockerEngineRuntimeState()
 
     public init(socketPath: String, containerSystemConfig: ContainerSystemConfig, log: Logger) {
         self.socketPath = socketPath
@@ -80,7 +81,7 @@ public struct DockerEngineServer: Sendable {
     }
 
     private func serve(_ connection: DockerHTTPConnection) async {
-        let router = DockerEngineRouter(containerSystemConfig: containerSystemConfig, log: log)
+        let router = DockerEngineRouter(containerSystemConfig: containerSystemConfig, log: log, runtimeState: runtimeState)
         do {
             try await connection.executeThenClose { inbound, outbound in
                 var head: HTTPRequestHead?
@@ -100,8 +101,13 @@ public struct DockerEngineServer: Sendable {
                             body.append(contentsOf: bytes)
                         }
                     case .end:
-                        if let requestHead {
-                            let response = await router.handle(method: requestHead.method, uri: requestHead.uri, body: body)
+                        if let requestHead = head {
+                            let response = await router.handle(
+                                method: requestHead.method,
+                                uri: requestHead.uri,
+                                headers: requestHead.headers,
+                                body: body
+                            )
                             try await Self.write(response, outbound: outbound)
                         }
                         head = nil

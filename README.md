@@ -52,7 +52,11 @@ docker compose up --detach
 docker compose down
 ```
 
-The current API supports image pull and inspection, detached container lifecycle, and Compose-managed networks and volumes. Image builds, interactive attach, exec, log following, host networking, and automatically assigned host ports are not supported by this compatibility API.
+The current API supports image pull and inspection, detached container lifecycle, and Compose-managed networks and volumes. Basic username/password credentials from Docker's registry-auth header are used only for that pull request. Compose service aliases are registered per network and resolved through a network-specific search domain under the configured DNS domain, or `containers.internal` when no domain is configured.
+
+Image builds, interactive attach, exec, log following, host networking, automatically assigned host ports, and identity-token or registry-token authentication are not supported. Non-default `HostConfig` options without an Apple Container equivalent are rejected instead of being silently ignored.
+
+The API reports the observed exit code for containers it starts while the API server is running; a stopped container without an observed exit result is reported with `ExitCode: -1`. The underlying network API still rejects duplicate aliases on a shared network.
 
 ### Upgrade or downgrade
 

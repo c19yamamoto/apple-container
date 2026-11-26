@@ -23,18 +23,21 @@ import ContainerizationExtras
 import ContainerizationOCI
 import Foundation
 import Logging
+import NIOCore
 import NIOHTTP1
 
 struct DockerEngineRouter: Sendable {
     static let apiVersion = "1.45"
     static let serverVersion = "0.1.0"
+    private static let fallbackDNSDomain = "containers.internal"
     private static let hiddenContainerPlugins = [ResourcePluginValues.machine, ResourcePluginValues.cluster]
     private static let maxLogBytesPerStream: UInt64 = 8 * 1024 * 1024
 
     let containerSystemConfig: ContainerSystemConfig
     let log: Logger
+    let runtimeState: DockerEngineRuntimeState
 
-    func handle(method: HTTPMethod, uri: String, body: Data) async -> DockerEngineResponse {
+    func handle(method: HTTPMethod, uri: String, headers: HTTPHeaders, body: Data) async -> DockerEngineResponse {
         guard let components = URLComponents(string: uri) else {
             return Self.error(.badRequest, "不正なリクエスト URI です")
         }
@@ -98,11 +101,12 @@ struct DockerEngineRouter: Sendable {
                 let id = pathParts[1]
                 if method == .DELETE {
                     try await ContainerClient().delete(id: id, force: query["force"] == "1" || query["force"] == "true")
+                    await runtimeState.removed(id: id)
                     return DockerEngineResponse(status: .noContent)
                 }
             }
             if method == .POST && path == "/images/create" {
-                return try await pullImage(query: query)
+                return try await pullImage(query: query, headers: headers)
             }
             if method == .GET && path == "/images/json" {
                 return try await listImages()
@@ -199,6 +203,7 @@ struct DockerEngineRouter: Sendable {
 
     private func createContainer(query: [String: String], body: Data) async throws -> DockerEngineResponse {
         let request = try JSONDecoder().decode(DockerCreateRequest.self, from: body)
+        try Self.validateUnsupportedHostConfig(body: body)
         guard !request.image.isEmpty else {
             throw DockerAPIError.badRequest("コンテナ作成時には Image が必要です")
         }
@@ -260,21 +265,40 @@ struct DockerEngineRouter: Sendable {
         config.readOnly = host.readonlyRootfs ?? false
         if let memory = host.memory, memory > 0 {
             config.resources.memoryInBytes = UInt64(memory)
+        } else if let memory = host.memory, memory < 0 {
+            throw DockerAPIError.badRequest("HostConfig.Memory は 0 以上である必要があります")
         }
         if let nanoCPUs = host.nanoCPUs, nanoCPUs > 0 {
-            config.resources.cpus = max(1, Int((nanoCPUs + 999_999_999) / 1_000_000_000))
+            guard nanoCPUs.isMultiple(of: 1_000_000_000) else {
+                throw DockerAPIError.unsupported("小数単位の CPU 制限はサポートされていません")
+            }
+            config.resources.cpus = Int(nanoCPUs / 1_000_000_000)
+        } else if let nanoCPUs = host.nanoCPUs, nanoCPUs < 0 {
+            throw DockerAPIError.badRequest("HostConfig.NanoCpus は 0 以上である必要があります")
         }
         if let size = host.shmSize, size > 0 {
             config.shmSize = UInt64(size)
+        } else if let size = host.shmSize, size < 0 {
+            throw DockerAPIError.badRequest("HostConfig.ShmSize は 0 以上である必要があります")
         }
         config.publishedPorts = try Self.publishPorts(host.portBindings ?? [:])
         config.mounts = try await makeMounts(host: host)
         config.networks = try await makeNetworkAttachments(id: id, request: request, host: host)
         let defaultDNS = containerSystemConfig.container.dns
+        let dnsDomain = Self.dockerDNSDomain(containerSystemConfig)
+        var searchDomains = host.dnsSearch.flatMap { $0.isEmpty ? nil : $0 } ?? defaultDNS?.searchDomains ?? []
+        let networkSearchDomains = config.networks
+            .map { Self.networkDNSDomain(network: $0.network, baseDomain: dnsDomain) }
+            .sorted()
+        for searchDomain in networkSearchDomains + [dnsDomain] {
+            if !searchDomains.contains(where: { AttachmentOptions.canonicalHostname($0) == AttachmentOptions.canonicalHostname(searchDomain) }) {
+                searchDomains.append(searchDomain)
+            }
+        }
         config.dns = .init(
             nameservers: host.dns.flatMap { $0.isEmpty ? nil : $0 } ?? defaultDNS?.nameservers ?? [],
-            domain: defaultDNS?.domain ?? containerSystemConfig.dns.domain,
-            searchDomains: host.dnsSearch.flatMap { $0.isEmpty ? nil : $0 } ?? defaultDNS?.searchDomains ?? [],
+            domain: dnsDomain,
+            searchDomains: searchDomains,
             options: host.dnsOptions.flatMap { $0.isEmpty ? nil : $0 } ?? defaultDNS?.options ?? []
         )
         if let sysctls = host.sysctls {
@@ -309,15 +333,18 @@ struct DockerEngineRouter: Sendable {
             entries = [(network.id, DockerEndpointConfig())]
         }
 
-        let systemConfig = containerSystemConfig
+        let dnsDomain = Self.dockerDNSDomain(containerSystemConfig)
         let hostname = request.hostname.flatMap { $0.isEmpty ? nil : $0 } ?? id
-        let qualifiedHostname = Self.qualify(hostname, domain: systemConfig.dns.domain)
+        let qualifiedHostname = Self.qualify(hostname, domain: dnsDomain)
         return try await entries.asyncMap { entry in
             let (networkName, endpoint) = entry
             let network = try await networkClient.get(id: networkName)
             let aliases = (endpoint.aliases ?? [])
-                .map { Self.qualify($0, domain: systemConfig.dns.domain) }
-                .filter { AttachmentOptions.canonicalHostname($0) != AttachmentOptions.canonicalHostname(qualifiedHostname) }
+                .map { Self.qualifyNetworkAlias($0, network: network.id, baseDomain: dnsDomain) }
+                .filter {
+                    AttachmentOptions.canonicalHostname($0) != AttachmentOptions.canonicalHostname(qualifiedHostname)
+                        && AttachmentOptions.canonicalHostname($0) != AttachmentOptions.canonicalHostname(hostname)
+                }
                 .reduce(into: [String]()) { result, alias in
                     if !result.contains(where: { AttachmentOptions.canonicalHostname($0) == AttachmentOptions.canonicalHostname(alias) }) {
                         result.append(alias)
@@ -361,7 +388,14 @@ struct DockerEngineRouter: Sendable {
             guard parts.count >= 2, !parts[0].isEmpty, !parts[1].isEmpty else {
                 throw DockerAPIError.badRequest("Binds の形式が正しくありません: \(bind)")
             }
-            let options = parts.count == 3 && parts[2].split(separator: ",").contains("ro") ? ["ro"] : []
+            let bindOptions = parts.count == 3 ? parts[2].split(separator: ",").map(String.init) : []
+            guard bindOptions.allSatisfy({ ["ro", "rw"].contains($0) }) else {
+                throw DockerAPIError.unsupported("bind mount の mode オプションは ro と rw のみサポートされています")
+            }
+            guard !(bindOptions.contains("ro") && bindOptions.contains("rw")) else {
+                throw DockerAPIError.badRequest("bind mount の mode に ro と rw は同時指定できません")
+            }
+            let options = bindOptions.contains("ro") ? ["ro"] : []
             if parts[0].hasPrefix("/") {
                 mounts.append(.virtiofs(source: parts[0], destination: parts[1], options: options))
             } else {
@@ -369,8 +403,15 @@ struct DockerEngineRouter: Sendable {
                 mounts.append(.volume(name: parts[0], format: volume.format, source: volume.source, destination: parts[1], options: options))
             }
         }
-        for (target, _) in host.tmpfs ?? [:] {
-            mounts.append(.tmpfs(destination: target, options: []))
+        for (target, value) in host.tmpfs ?? [:] {
+            let tmpfsOptions = value.split(separator: ",").map(String.init)
+            guard tmpfsOptions.allSatisfy({ ["ro", "rw"].contains($0) }) else {
+                throw DockerAPIError.unsupported("tmpfs のサイズや mode オプションはサポートされていません")
+            }
+            guard !(tmpfsOptions.contains("ro") && tmpfsOptions.contains("rw")) else {
+                throw DockerAPIError.badRequest("tmpfs の mode に ro と rw は同時指定できません")
+            }
+            mounts.append(.tmpfs(destination: target, options: tmpfsOptions.contains("ro") ? ["ro"] : []))
         }
         return mounts
     }
@@ -405,6 +446,13 @@ struct DockerEngineRouter: Sendable {
         let client = ContainerClient()
         let process = try await client.bootstrap(id: id, stdio: [nil, nil, nil])
         try await process.start()
+        await runtimeState.started(id: id)
+        let runtimeState = self.runtimeState
+        Task {
+            if let exitCode = try? await process.wait() {
+                await runtimeState.exited(id: id, exitCode: exitCode)
+            }
+        }
     }
 
     private func stopContainer(id: String, timeout: String?) async throws {
@@ -414,7 +462,8 @@ struct DockerEngineRouter: Sendable {
 
     private func inspectContainer(id: String) async throws -> DockerEngineResponse {
         let snapshot = try await ContainerClient().get(id: id)
-        return try Self.json(.ok, Self.containerInspection(snapshot))
+        let runtime = await runtimeState.state(id: id)
+        return try Self.json(.ok, Self.containerInspection(snapshot, runtime: runtime))
     }
 
     private func containerLogs(id: String, query: [String: String]) async throws -> DockerEngineResponse {
@@ -444,15 +493,82 @@ struct DockerEngineRouter: Sendable {
         return DockerEngineResponse(status: .ok, body: body, contentType: "application/vnd.docker.raw-stream")
     }
 
-    private func pullImage(query: [String: String]) async throws -> DockerEngineResponse {
+    private func pullImage(query: [String: String], headers: HTTPHeaders) async throws -> DockerEngineResponse {
         guard let image = query["fromImage"], !image.isEmpty else {
             throw DockerAPIError.badRequest("fromImage query parameter が必要です")
         }
         let reference = query["tag"].flatMap { $0.isEmpty ? nil : "\(image):\($0)" } ?? image
-        let image = try await ClientImage.pull(reference: reference, containerSystemConfig: containerSystemConfig)
+        let registryCredentials = try Self.registryCredentials(
+            header: headers.first(name: "X-Registry-Auth"),
+            image: reference,
+            containerSystemConfig: containerSystemConfig
+        )
+        let image = try await ClientImage.pull(
+            reference: reference,
+            containerSystemConfig: containerSystemConfig,
+            registryCredentials: registryCredentials
+        )
         _ = try await image.getCreateSnapshot(platform: .current)
         let message = try JSONSerialization.data(withJSONObject: ["status": "Pull complete", "id": image.digest])
         return DockerEngineResponse(status: .ok, body: message + Data([0x0A]))
+    }
+
+    private static func registryCredentials(
+        header: String?,
+        image: String,
+        containerSystemConfig: ContainerSystemConfig
+    ) throws -> RegistryCredentials? {
+        guard let header, !header.isEmpty else { return nil }
+        var encoded = header.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        while !encoded.count.isMultiple(of: 4) {
+            encoded.append("=")
+        }
+        guard let data = Data(base64Encoded: encoded, options: .ignoreUnknownCharacters) else {
+            throw DockerAPIError.badRequest("X-Registry-Auth が base64 ではありません")
+        }
+        let auth = try JSONDecoder().decode(DockerRegistryAuth.self, from: data)
+        if !(auth.identityToken ?? "").isEmpty || !(auth.registryToken ?? "").isEmpty {
+            throw DockerAPIError.unsupported("identity token と registry token による pull はサポートされていません")
+        }
+
+        var username = auth.username ?? ""
+        var password = auth.password ?? ""
+        if username.isEmpty, let encodedAuth = auth.auth, !encodedAuth.isEmpty {
+            guard let credentialData = Data(base64Encoded: encodedAuth, options: .ignoreUnknownCharacters),
+                let credential = String(data: credentialData, encoding: .utf8),
+                let separator = credential.firstIndex(of: ":")
+            else {
+                throw DockerAPIError.badRequest("X-Registry-Auth の auth 値が正しくありません")
+            }
+            username = String(credential[..<separator])
+            password = String(credential[credential.index(after: separator)...])
+        }
+        guard !username.isEmpty || !password.isEmpty else { return nil }
+
+        if let serverAddress = auth.serverAddress, !serverAddress.isEmpty {
+            let normalized = try ClientImage.normalizeReference(image, containerSystemConfig: containerSystemConfig)
+            guard let imageDomain = try Reference.parse(normalized).resolvedDomain else {
+                throw DockerAPIError.badRequest("pull 対象の registry を判定できません")
+            }
+            let authDomain = Self.registryDomain(serverAddress)
+            let imageRegistry = Self.registryDomain(imageDomain)
+            let dockerHubDomains: Set<String> = ["docker.io", "index.docker.io", "registry-1.docker.io"]
+            guard authDomain == imageRegistry || (dockerHubDomains.contains(authDomain) && dockerHubDomains.contains(imageRegistry)) else {
+                throw DockerAPIError.badRequest("X-Registry-Auth の registry が pull 対象と一致しません")
+            }
+        }
+        return RegistryCredentials(username: username, password: password)
+    }
+
+    private static func registryDomain(_ value: String) -> String {
+        let url = URLComponents(string: value)
+        let host: String
+        if let urlHost = url?.host {
+            host = url?.port.map { "\(urlHost):\($0)" } ?? urlHost
+        } else {
+            host = value.split(separator: "/", maxSplits: 1).first.map(String.init) ?? value
+        }
+        return Reference.resolveDomain(domain: host).lowercased()
     }
 
     private func listImages() async throws -> DockerEngineResponse {
@@ -554,7 +670,7 @@ struct DockerEngineRouter: Sendable {
     private static func containerSummary(_ snapshot: ContainerSnapshot) -> [String: Any] {
         let config = snapshot.configuration
         let process = config.initProcess
-        let state = snapshot.status == .running ? "running" : "exited"
+        let state = snapshot.status == .running ? "running" : (snapshot.startedDate == nil ? "created" : "exited")
         return [
             "Id": snapshot.id,
             "Names": ["/\(snapshot.id)"],
@@ -562,20 +678,23 @@ struct DockerEngineRouter: Sendable {
             "ImageID": config.image.digest,
             "Command": ([process.executable] + process.arguments).joined(separator: " "),
             "Created": Int64(config.creationDate.timeIntervalSince1970),
-            "Ports": config.publishedPorts.map { ["IP": $0.hostAddress.description, "PrivatePort": $0.containerPort, "PublicPort": $0.hostPort, "Type": $0.proto.rawValue] as [String: Any] },
+            "Ports": publishedPortSummary(config.publishedPorts),
             "Labels": config.labels,
             "State": state,
             "Status": state,
             "HostConfig": ["NetworkMode": config.networks.first?.network ?? "default"],
-            "NetworkSettings": ["Networks": networkSettings(snapshot.networks, configured: config.networks)],
+            "NetworkSettings": ["Networks": networkSettings(snapshot.networks, configured: config.networks, baseDomain: config.dns?.domain ?? fallbackDNSDomain)],
         ]
     }
 
-    private static func containerInspection(_ snapshot: ContainerSnapshot) -> [String: Any] {
+    private static func containerInspection(_ snapshot: ContainerSnapshot, runtime: DockerEngineExitState?) -> [String: Any] {
         let config = snapshot.configuration
         let process = config.initProcess
         let startedAt = snapshot.startedDate.map { ISO8601DateFormatter().string(from: $0) } ?? "0001-01-01T00:00:00Z"
         let running = snapshot.status == .running
+        let stateStatus = snapshot.status == .running ? "running" : (snapshot.startedDate == nil ? "created" : "exited")
+        let exitCode = runtime?.exitCode ?? (running || snapshot.startedDate == nil ? 0 : -1)
+        let finishedAt = runtime.map { ISO8601DateFormatter().string(from: $0.finishedAt) } ?? "0001-01-01T00:00:00Z"
         let env = process.environment
         let mounts = config.mounts.map { mount -> [String: Any] in
             ["Type": mount.isVolume ? "volume" : (mount.isTmpfs ? "tmpfs" : "bind"), "Source": mount.source, "Destination": mount.destination, "Mode": mount.options.joined(separator: ","), "RW": !mount.options.readonly, "Propagation": "rprivate"]
@@ -585,7 +704,7 @@ struct DockerEngineRouter: Sendable {
             "Created": ISO8601DateFormatter().string(from: config.creationDate),
             "Path": process.executable,
             "Args": process.arguments,
-            "State": ["Status": running ? "running" : "exited", "Running": running, "Paused": false, "Restarting": false, "OOMKilled": false, "Dead": false, "Pid": 0, "ExitCode": 0, "Error": "", "StartedAt": startedAt, "FinishedAt": "0001-01-01T00:00:00Z"],
+            "State": ["Status": stateStatus, "Running": running, "Paused": false, "Restarting": false, "OOMKilled": false, "Dead": false, "Pid": 0, "ExitCode": exitCode, "Error": "", "StartedAt": startedAt, "FinishedAt": finishedAt],
             "Image": config.image.digest,
             "Name": "/\(snapshot.id)",
             "RestartCount": 0,
@@ -595,42 +714,108 @@ struct DockerEngineRouter: Sendable {
             "ProcessLabel": "",
             "AppArmorProfile": "",
             "ExecIDs": NSNull(),
-            "HostConfig": ["NetworkMode": config.networks.first?.network ?? "default", "ReadonlyRootfs": config.readOnly, "Binds": []],
+            "HostConfig": [
+                "NetworkMode": config.networks.first?.network ?? "default",
+                "ReadonlyRootfs": config.readOnly,
+                "PortBindings": publishedPortBindings(config.publishedPorts),
+                "Binds": [],
+            ],
             "GraphDriver": ["Name": "containerization", "Data": [:]],
-            "Config": ["Hostname": snapshot.id, "User": process.user.description, "Env": env, "Cmd": [process.executable] + process.arguments, "Image": config.image.reference, "WorkingDir": process.workingDirectory, "Entrypoint": [process.executable], "Labels": config.labels, "Tty": process.terminal, "OpenStdin": false, "StopSignal": config.stopSignal ?? "SIGTERM"],
-            "NetworkSettings": ["Networks": networkSettings(snapshot.networks, configured: config.networks), "Ports": [:]],
+            "Config": [
+                "Hostname": config.networks.first?.options.hostname.split(separator: ".", maxSplits: 1).first.map(String.init) ?? snapshot.id,
+                "User": process.user.description,
+                "Env": env,
+                "Cmd": [process.executable] + process.arguments,
+                "Image": config.image.reference,
+                "WorkingDir": process.workingDirectory,
+                "Entrypoint": [process.executable],
+                "ExposedPorts": exposedPorts(config.publishedPorts),
+                "Labels": config.labels,
+                "Tty": process.terminal,
+                "OpenStdin": false,
+                "StopSignal": config.stopSignal ?? "SIGTERM",
+            ],
+            "NetworkSettings": ["Networks": networkSettings(snapshot.networks, configured: config.networks, baseDomain: config.dns?.domain ?? fallbackDNSDomain), "Ports": publishedPortBindings(config.publishedPorts)],
             "Mounts": mounts,
         ]
     }
 
-    private static func networkSettings(_ attachments: [Attachment]) -> [String: Any] {
-        Dictionary(uniqueKeysWithValues: attachments.map { attachment in
-            (attachment.network, [
+    private static func publishedPortSummary(_ ports: [PublishPort]) -> [[String: Any]] {
+        ports.flatMap { port in
+            (0..<port.count).map { offset in
+                [
+                    "IP": port.hostAddress.description,
+                    "PrivatePort": Int(port.containerPort + offset),
+                    "PublicPort": Int(port.hostPort + offset),
+                    "Type": port.proto.rawValue,
+                ] as [String: Any]
+            }
+        }
+    }
+
+    private static func publishedPortBindings(_ ports: [PublishPort]) -> [String: Any] {
+        var result = [String: [[String: String]]]()
+        for port in ports {
+            for offset in 0..<port.count {
+                let key = "\(port.containerPort + offset)/\(port.proto.rawValue)"
+                result[key, default: []].append([
+                    "HostIp": port.hostAddress.description,
+                    "HostPort": "\(port.hostPort + offset)",
+                ])
+            }
+        }
+        return result.mapValues { $0 as Any }
+    }
+
+    private static func exposedPorts(_ ports: [PublishPort]) -> [String: Any] {
+        var result = [String: [String: String]]()
+        for port in ports {
+            for offset in 0..<port.count {
+                result["\(port.containerPort + offset)/\(port.proto.rawValue)"] = [:]
+            }
+        }
+        return result.mapValues { $0 as Any }
+    }
+
+    private static func networkSettings(
+        _ attachments: [Attachment],
+        configured: [AttachmentConfiguration],
+        baseDomain: String
+    ) -> [String: Any] {
+        guard !attachments.isEmpty else {
+            return Dictionary(uniqueKeysWithValues: configured.map { attachment in
+                (attachment.network, [
+                    "NetworkID": attachment.network,
+                    "EndpointID": "",
+                    "Gateway": "",
+                    "IPAddress": "",
+                    "IPPrefixLen": 0,
+                    "MacAddress": "",
+                    "Aliases": [attachment.options.hostname] + attachment.options.aliases.map {
+                        Self.unqualifyNetworkAlias($0, network: attachment.network, baseDomain: baseDomain)
+                    },
+                ] as [String: Any])
+            })
+        }
+
+        let configuredByNetwork = Dictionary(uniqueKeysWithValues: configured.map { ($0.network, $0) })
+        return Dictionary(uniqueKeysWithValues: attachments.map { attachment in
+            let aliases = [attachment.hostname] + (configuredByNetwork[attachment.network]?.options.aliases ?? []).map {
+                Self.unqualifyNetworkAlias($0, network: attachment.network, baseDomain: baseDomain)
+            }
+            let uniqueAliases = aliases.reduce(into: [String]()) { result, alias in
+                if !result.contains(where: { AttachmentOptions.canonicalHostname($0) == AttachmentOptions.canonicalHostname(alias) }) {
+                    result.append(alias)
+                }
+            }
+            return (attachment.network, [
                 "NetworkID": attachment.network,
                 "EndpointID": "",
                 "Gateway": attachment.ipv4Gateway.description,
                 "IPAddress": String(attachment.ipv4Address.address.description),
                 "IPPrefixLen": attachment.ipv4Address.prefixLength,
                 "MacAddress": attachment.macAddress?.description ?? "",
-                "Aliases": [attachment.hostname],
-            ] as [String: Any])
-        })
-    }
-
-    private static func networkSettings(
-        _ attachments: [Attachment],
-        configured: [AttachmentConfiguration]
-    ) -> [String: Any] {
-        guard attachments.isEmpty else { return networkSettings(attachments) }
-        return Dictionary(uniqueKeysWithValues: configured.map { attachment in
-            (attachment.network, [
-                "NetworkID": attachment.network,
-                "EndpointID": "",
-                "Gateway": "",
-                "IPAddress": "",
-                "IPPrefixLen": 0,
-                "MacAddress": "",
-                "Aliases": [attachment.options.hostname] + attachment.options.aliases,
+                "Aliases": uniqueAliases,
             ] as [String: Any])
         })
     }
@@ -679,6 +864,127 @@ struct DockerEngineRouter: Sendable {
     private static func qualify(_ name: String, domain: String?) -> String {
         guard let domain, !domain.isEmpty, !name.contains(".") else { return name }
         return "\(name).\(domain)."
+    }
+
+    private static func dockerDNSDomain(_ config: ContainerSystemConfig) -> String {
+        for configured in [config.container.dns?.domain, config.dns.domain].compactMap({ $0 }) {
+            let domain = configured.trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            if !domain.isEmpty {
+                return domain.lowercased()
+            }
+        }
+        return Self.fallbackDNSDomain
+    }
+
+    private static func networkDNSDomain(network: String, baseDomain: String) -> String {
+        let prefix = String(
+            network.lowercased().utf8.prefix(24).map { byte -> Character in
+                if (48...57).contains(byte) || (97...122).contains(byte) {
+                    return Character(UnicodeScalar(byte))
+                }
+                return "-"
+            }
+        ).trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        let hash = network.utf8.reduce(UInt64(14_695_981_039_346_656_037)) { ($0 ^ UInt64($1)) &* 1_099_511_628_211 }
+        let networkLabel = "net-\(prefix.isEmpty ? "x" : prefix)-\(String(hash, radix: 16))"
+        return "\(networkLabel).\(baseDomain.trimmingCharacters(in: CharacterSet(charactersIn: ".")))"
+    }
+
+    private static func qualifyNetworkAlias(_ alias: String, network: String, baseDomain: String) -> String {
+        let name = alias.trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        return "\(name).\(networkDNSDomain(network: network, baseDomain: baseDomain))."
+    }
+
+    private static func unqualifyNetworkAlias(_ alias: String, network: String, baseDomain: String) -> String {
+        let name = alias.hasSuffix(".") ? String(alias.dropLast()) : alias
+        let suffix = ".\(networkDNSDomain(network: network, baseDomain: baseDomain))"
+        guard name.hasSuffix(suffix) else { return alias }
+        return String(name.dropLast(suffix.count))
+    }
+
+    private static func validateUnsupportedHostConfig(body: Data) throws {
+        guard let request = try JSONSerialization.jsonObject(with: body) as? [String: Any],
+            let hostConfig = request["HostConfig"] as? [String: Any]
+        else {
+            return
+        }
+
+        let supported: Set<String> = [
+            "Binds", "Mounts", "PortBindings", "NetworkMode", "Memory", "NanoCpus",
+            "ReadonlyRootfs", "ShmSize", "Dns", "DnsSearch", "DnsOptions", "Sysctls", "Tmpfs",
+        ]
+        for (key, value) in hostConfig where !supported.contains(key) && hasNonDefaultValue(value, field: key) {
+            throw DockerAPIError.unsupported("HostConfig.\(key) が指定されていますが、この API ではサポートされていません")
+        }
+
+        if let mounts = hostConfig["Mounts"] as? [[String: Any]] {
+            let supportedMountFields: Set<String> = ["Type", "Source", "Target", "ReadOnly", "Consistency", "BindOptions", "VolumeOptions", "TmpfsOptions"]
+            for (index, mount) in mounts.enumerated() {
+                for (key, value) in mount where !supportedMountFields.contains(key) && hasNonDefaultValue(value, field: key) {
+                    throw DockerAPIError.unsupported("HostConfig.Mounts[\(index)].\(key) はサポートされていません")
+                }
+                if let consistency = mount["Consistency"] as? String, !consistency.isEmpty, consistency != "consistent" {
+                    throw DockerAPIError.unsupported("HostConfig.Mounts[\(index)].Consistency はサポートされていません")
+                }
+                for (key, allowed) in [
+                    ("BindOptions", Set(["Propagation", "NonRecursive", "CreateMountpoint", "ReadOnlyNonRecursive", "ReadOnlyForceRecursive"])),
+                    ("VolumeOptions", Set(["NoCopy", "Labels", "DriverConfig", "Subpath"])),
+                    ("TmpfsOptions", Set(["SizeBytes", "Mode", "Options"])),
+                ] {
+                    guard let options = mount[key] as? [String: Any] else { continue }
+                    for (option, value) in options {
+                        guard allowed.contains(option) else {
+                            if hasNonDefaultValue(value, field: option) {
+                                throw DockerAPIError.unsupported("HostConfig.Mounts[\(index)].\(key).\(option) はサポートされていません")
+                            }
+                            continue
+                        }
+                        if key == "BindOptions", option == "Propagation", ["", "rprivate"].contains(value as? String ?? "") {
+                            continue
+                        }
+                        if hasNonDefaultValue(value, field: option) {
+                            throw DockerAPIError.unsupported("HostConfig.Mounts[\(index)].\(key).\(option) はサポートされていません")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static func hasNonDefaultValue(_ value: Any, field: String? = nil) -> Bool {
+        if let value = value as? [String: Any] {
+            if field == "RestartPolicy" {
+                let name = value["Name"] as? String ?? ""
+                let retryCount = (value["MaximumRetryCount"] as? NSNumber)?.intValue ?? 0
+                return !["", "no"].contains(name) || retryCount != 0
+            }
+            if field == "LogConfig" {
+                let type = value["Type"] as? String ?? ""
+                let config = value["Config"] as? [String: Any] ?? [:]
+                return !["", "json-file", "local"].contains(type) || !config.isEmpty
+            }
+            if field == "CgroupnsMode" {
+                let mode = value["Mode"] as? String ?? ""
+                return !["", "private"].contains(mode)
+            }
+            return value.contains { hasNonDefaultValue($0.value, field: $0.key) }
+        }
+        if let values = value as? [Any] {
+            return values.contains { hasNonDefaultValue($0) }
+        }
+        if value is NSNull {
+            return false
+        }
+        if let number = value as? NSNumber {
+            return number.doubleValue != 0
+        }
+        if let string = value as? String {
+            if field == "CgroupnsMode" {
+                return !["", "private"].contains(string)
+            }
+            return !string.isEmpty
+        }
+        return true
     }
 
     private static func status(for error: Error) -> HTTPResponseStatus {
@@ -863,6 +1169,49 @@ private struct DockerVolumeCreateRequest: Decodable {
     let driverOpts: [String: String]?
     let labels: [String: String]?
     enum CodingKeys: String, CodingKey { case name = "Name"; case driver = "Driver"; case driverOpts = "DriverOpts"; case labels = "Labels" }
+}
+
+private struct DockerRegistryAuth: Decodable {
+    let username: String?
+    let password: String?
+    let auth: String?
+    let serverAddress: String?
+    let identityToken: String?
+    let registryToken: String?
+
+    enum CodingKeys: String, CodingKey {
+        case username
+        case password
+        case auth
+        case serverAddress = "serveraddress"
+        case identityToken = "identitytoken"
+        case registryToken = "registrytoken"
+    }
+}
+
+struct DockerEngineExitState: Sendable {
+    let exitCode: Int32
+    let finishedAt: Date
+}
+
+actor DockerEngineRuntimeState {
+    private var exits = [String: DockerEngineExitState]()
+
+    func started(id: String) {
+        exits.removeValue(forKey: id)
+    }
+
+    func exited(id: String, exitCode: Int32) {
+        exits[id] = DockerEngineExitState(exitCode: exitCode, finishedAt: Date())
+    }
+
+    func state(id: String) -> DockerEngineExitState? {
+        exits[id]
+    }
+
+    func removed(id: String) {
+        exits.removeValue(forKey: id)
+    }
 }
 
 private extension Sequence {
