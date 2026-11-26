@@ -24,6 +24,9 @@ import NIOPosix
 typealias DockerHTTPConnection = NIOAsyncChannel<HTTPServerRequestPart, HTTPServerResponsePart>
 typealias DockerHTTPWriter = NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>
 
+private let maxDockerRequestBodyBytes = 16 * 1024 * 1024
+private let maxDockerBuildContextBytes = 256 * 1024 * 1024
+
 public struct DockerEngineListener: Sendable {
     fileprivate let channel: NIOAsyncChannel<DockerHTTPConnection, Never>
 }
@@ -86,13 +89,15 @@ public struct DockerEngineServer: Sendable {
             try await connection.executeThenClose { inbound, outbound in
                 var head: HTTPRequestHead?
                 var body = Data()
+                var maxBodyBytes = maxDockerRequestBodyBytes
                 for try await part in inbound {
                     switch part {
                     case .head(let requestHead):
                         head = requestHead
                         body.removeAll(keepingCapacity: true)
+                        maxBodyBytes = Self.maxRequestBodyBytes(for: requestHead)
                     case .body(let buffer):
-                        guard body.count + buffer.readableBytes <= 16 * 1024 * 1024 else {
+                        guard body.count + buffer.readableBytes <= maxBodyBytes else {
                             try await Self.write(DockerEngineResponse(status: .payloadTooLarge), outbound: outbound)
                             connection.channel.close(promise: nil)
                             return
@@ -118,6 +123,19 @@ public struct DockerEngineServer: Sendable {
         } catch {
             log.debug("Docker API 接続を終了しました", metadata: ["error": "\(error)"])
         }
+    }
+
+    private static func maxRequestBodyBytes(for request: HTTPRequestHead) -> Int {
+        guard request.method == .POST,
+            let path = URLComponents(string: request.uri)?.path
+        else {
+            return maxDockerRequestBodyBytes
+        }
+        let parts = path.split(separator: "/")
+        let endpointParts = parts.first?.range(of: #"^v\d+\.\d+$"#, options: .regularExpression) != nil
+            ? parts.dropFirst()
+            : parts[...]
+        return endpointParts.elementsEqual(["build"]) ? maxDockerBuildContextBytes : maxDockerRequestBodyBytes
     }
 
     private static func write(_ response: DockerEngineResponse, outbound: DockerHTTPWriter) async throws {

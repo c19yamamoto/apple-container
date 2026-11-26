@@ -15,9 +15,11 @@
 //===----------------------------------------------------------------------===//
 
 import ContainerAPIClient
+import ContainerCommands
 import ContainerPersistence
 import ContainerResource
 import Containerization
+import ContainerizationArchive
 import ContainerizationError
 import ContainerizationExtras
 import ContainerizationOCI
@@ -72,6 +74,9 @@ struct DockerEngineRouter: Sendable {
             }
             if method == .GET && path == "/containers/json" {
                 return try await listContainers(query: query)
+            }
+            if method == .POST && path == "/build" {
+                return try await buildImage(queryItems: components.queryItems ?? [], body: body)
             }
             if method == .POST && path == "/containers/create" {
                 return try await createContainer(query: query, body: body)
@@ -198,12 +203,156 @@ struct DockerEngineRouter: Sendable {
         if !all {
             snapshots = snapshots.filter { $0.status == .running }
         }
-        return try Self.json(.ok, snapshots.map(Self.containerSummary))
+        let summaries = await snapshots.asyncMap { snapshot in
+            Self.containerSummary(snapshot, health: await runtimeState.health(id: snapshot.id))
+        }
+        return try Self.json(.ok, summaries)
+    }
+
+    private func buildImage(queryItems: [URLQueryItem], body: Data) async throws -> DockerEngineResponse {
+        guard !body.isEmpty else {
+            throw DockerAPIError.badRequest("Docker build context が空です")
+        }
+        let query = Dictionary(queryItems.compactMap { item in item.value.map { (item.name, $0) } }, uniquingKeysWith: { _, newest in newest })
+        let supportedBuildOptions: Set<String> = [
+            "dockerfile", "t", "buildargs", "labels", "target", "nocache", "pull", "q", "forcerm", "rm", "platform", "ssh", "version",
+        ]
+        for item in queryItems where !supportedBuildOptions.contains(item.name) && !(item.value ?? "").isEmpty {
+            throw DockerAPIError.unsupported("build option \(item.name) はサポートされていません")
+        }
+        for flag in ["nocache", "pull", "q", "forcerm", "rm"] {
+            _ = try Self.queryFlag(query[flag], field: flag)
+        }
+        if let version = query["version"], version != "2" {
+            throw DockerAPIError.unsupported("build version \(version) はサポートされていません")
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("docker-build-\(UUID().uuidString)", isDirectory: true)
+        let context = root.appendingPathComponent("context", isDirectory: true)
+        let archive = root.appendingPathComponent("context.tar")
+        try FileManager.default.createDirectory(at: context, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try body.write(to: archive, options: .atomic)
+
+        do {
+            let reader = try ArchiveReader(file: archive)
+            var uncompressedBytes: Int64 = 0
+            var entryCount = 0
+            for (entry, _) in reader.makeStreamingIterator() {
+                entryCount += 1
+                guard entryCount <= 100_000 else {
+                    throw DockerAPIError.badRequest("build context のファイル数は 100,000 以下である必要があります")
+                }
+                guard entry.fileType == .regular else { continue }
+                let entrySize = max(entry.size ?? 0, 0)
+                let remainingBytes = 1_073_741_824 - uncompressedBytes
+                guard entrySize <= remainingBytes else {
+                    throw DockerAPIError.badRequest("展開後の build context は 1 GiB 以下である必要があります")
+                }
+                uncompressedBytes += entrySize
+            }
+            try reader.throwIfStreamFailed()
+        } catch let error as DockerAPIError {
+            throw error
+        } catch {
+            throw DockerAPIError.badRequest("build context を読み込めません: \(error)")
+        }
+
+        let rejectedMembers: [String]
+        do {
+            rejectedMembers = try ArchiveReader(file: archive).extractContents(to: context)
+        } catch {
+            throw DockerAPIError.badRequest("build context を展開できません: \(error)")
+        }
+        guard rejectedMembers.isEmpty else {
+            throw DockerAPIError.badRequest("build context に不正なパスが含まれています")
+        }
+
+        let dockerfile = query["dockerfile"] ?? "Dockerfile"
+        let dockerfileURL = URL(fileURLWithPath: dockerfile, relativeTo: context).standardizedFileURL
+        let contextPath = context.standardizedFileURL.path
+        let dockerfileType = try? FileManager.default.attributesOfItem(atPath: dockerfileURL.path)[.type] as? FileAttributeType
+        guard !dockerfile.hasPrefix("/"), dockerfileURL.path.hasPrefix(contextPath + "/"),
+            dockerfileType == .typeRegular
+        else {
+            throw DockerAPIError.badRequest("Dockerfile が build context 内にありません")
+        }
+
+        var options = BuildOptions()
+        options.contextDir = contextPath
+        options.file = dockerfileURL.path
+        options.buildArg = try Self.buildOptions(query["buildargs"], field: "buildargs")
+            .map { "\($0.key)=\($0.value)" }
+        options.label = try Self.buildOptions(query["labels"], field: "labels")
+            .map { "\($0.key)=\($0.value)" }
+        options.target = query["target"] ?? ""
+        options.noCache = try Self.queryFlag(query["nocache"], field: "nocache")
+        options.pull = try Self.queryFlag(query["pull"], field: "pull")
+        if let platform = query["platform"], !platform.isEmpty {
+            options.platform = [[platform]]
+            do {
+                _ = try options.resolvePlatforms()
+            } catch {
+                throw DockerAPIError.badRequest("build platform が不正です: \(error)")
+            }
+        }
+        if let ssh = query["ssh"], !ssh.isEmpty {
+            options.ssh = ssh
+        }
+        options.quiet = true
+        options.progress = .plain
+        options.output = ["type=oci"]
+        let tags = queryItems.filter { $0.name == "t" }.compactMap(\.value)
+        let resultTag = tags.first ?? "apple-container-build:\(UUID().uuidString.lowercased())"
+        options.targetImageNames = tags.isEmpty ? [resultTag] : tags
+        do {
+            try options.validate()
+        } catch {
+            throw DockerAPIError.badRequest("build option が不正です: \(error)")
+        }
+        try await options.runLinuxBuild(containerSystemConfig: containerSystemConfig)
+
+        let image = try await ClientImage.get(reference: resultTag, containerSystemConfig: containerSystemConfig)
+        let imageID = image.digest.hasPrefix("sha256:") ? image.digest : "sha256:\(image.digest)"
+        var response = try JSONSerialization.data(withJSONObject: ["stream": "Successfully built \(resultTag)\n"])
+        response.append(0x0A)
+        response.append(try JSONSerialization.data(withJSONObject: ["aux": ["ID": imageID]]))
+        response.append(0x0A)
+        return DockerEngineResponse(status: .ok, body: response)
+    }
+
+    private static func buildOptions(_ value: String?, field: String) throws -> [String: String] {
+        guard let value, !value.isEmpty else { return [:] }
+        do {
+            return try JSONDecoder().decode([String: String].self, from: Data(value.utf8))
+        } catch {
+            throw DockerAPIError.badRequest("\(field) は文字列値を持つ JSON object である必要があります")
+        }
+    }
+
+    private static func queryFlag(_ value: String?, field: String) throws -> Bool {
+        guard let value else { return false }
+        switch value.lowercased() {
+        case "1", "true": return true
+        case "0", "false", "": return false
+        default: throw DockerAPIError.badRequest("build option \(field) は boolean である必要があります")
+        }
     }
 
     private func createContainer(query: [String: String], body: Data) async throws -> DockerEngineResponse {
         let request = try JSONDecoder().decode(DockerCreateRequest.self, from: body)
         try Self.validateUnsupportedCreateConfig(body: body)
+        if let healthcheck = request.healthcheck, !healthcheck.isDisabled, healthcheck.command == nil {
+            throw DockerAPIError.badRequest("Healthcheck.Test に CMD または CMD-SHELL のコマンドが必要です")
+        }
+        if let healthcheck = request.healthcheck,
+            [healthcheck.interval, healthcheck.timeout, healthcheck.startPeriod, healthcheck.startInterval].compactMap({ $0 }).contains(where: { $0 < 0 })
+                || (healthcheck.retries ?? 0) < 0
+        {
+            throw DockerAPIError.badRequest("Healthcheck の期間と Retries は 0 以上である必要があります")
+        }
+        if request.healthcheck?.isDisabled == true, request.healthcheck?.test?.count != 1 {
+            throw DockerAPIError.badRequest("Healthcheck.Test の NONE には他の値を指定できません")
+        }
         guard !request.image.isEmpty else {
             throw DockerAPIError.badRequest("コンテナ作成時には Image が必要です")
         }
@@ -240,6 +389,7 @@ struct DockerEngineRouter: Sendable {
         )
         let kernel = try await ClientKernel.getDefaultKernel(for: .current)
         try await ContainerClient().create(configuration: config, options: .default, kernel: kernel)
+        await runtimeState.configureHealthcheck(id: id, healthcheck: request.healthcheck, process: process)
         return try Self.json(.created, ["Id": id, "Warnings": []] as [String: Any])
     }
 
@@ -463,7 +613,9 @@ struct DockerEngineRouter: Sendable {
     private func inspectContainer(id: String) async throws -> DockerEngineResponse {
         let snapshot = try await ContainerClient().get(id: id)
         let runtime = await runtimeState.state(id: id)
-        return try Self.json(.ok, Self.containerInspection(snapshot, runtime: runtime))
+        let healthcheck = await runtimeState.healthcheck(id: id)
+        let health = await runtimeState.health(id: id)
+        return try Self.json(.ok, Self.containerInspection(snapshot, runtime: runtime, healthcheck: healthcheck, health: health))
     }
 
     private func containerLogs(id: String, query: [String: String]) async throws -> DockerEngineResponse {
@@ -503,13 +655,13 @@ struct DockerEngineRouter: Sendable {
             image: reference,
             containerSystemConfig: containerSystemConfig
         )
-        let image = try await ClientImage.pull(
+        let pulledImage = try await ClientImage.pull(
             reference: reference,
             containerSystemConfig: containerSystemConfig,
             registryCredentials: registryCredentials
         )
-        _ = try await image.getCreateSnapshot(platform: .current)
-        let message = try JSONSerialization.data(withJSONObject: ["status": "Pull complete", "id": image.digest])
+        _ = try await pulledImage.getCreateSnapshot(platform: .current)
+        let message = try JSONSerialization.data(withJSONObject: ["status": "Pull complete", "id": pulledImage.digest])
         return DockerEngineResponse(status: .ok, body: message + Data([0x0A]))
     }
 
@@ -573,7 +725,7 @@ struct DockerEngineRouter: Sendable {
 
     private func listImages() async throws -> DockerEngineResponse {
         let images = try await ClientImage.list()
-        let results = try await images.asyncMap { image in
+        let results = await images.asyncMap { image in
             [
                 "Id": "sha256:\(image.digest.split(separator: ":").last ?? Substring(image.digest))",
                 "ParentId": "",
@@ -667,10 +819,11 @@ struct DockerEngineRouter: Sendable {
         return try Self.json(.ok, Self.volumeInspection(volume))
     }
 
-    private static func containerSummary(_ snapshot: ContainerSnapshot) -> [String: Any] {
+    private static func containerSummary(_ snapshot: ContainerSnapshot, health: DockerEngineHealthSnapshot?) -> [String: Any] {
         let config = snapshot.configuration
         let process = config.initProcess
         let state = snapshot.status == .running ? "running" : (snapshot.startedDate == nil ? "created" : "exited")
+        let status = health.map { state == "running" ? "Up (\($0.status.rawValue))" : state } ?? state
         return [
             "Id": snapshot.id,
             "Names": ["/\(snapshot.id)"],
@@ -681,13 +834,18 @@ struct DockerEngineRouter: Sendable {
             "Ports": publishedPortSummary(config.publishedPorts),
             "Labels": config.labels,
             "State": state,
-            "Status": state,
+            "Status": status,
             "HostConfig": ["NetworkMode": config.networks.first?.network ?? "default"],
             "NetworkSettings": ["Networks": networkSettings(snapshot.networks, configured: config.networks, baseDomain: config.dns?.domain ?? fallbackDNSDomain)],
         ]
     }
 
-    private static func containerInspection(_ snapshot: ContainerSnapshot, runtime: DockerEngineExitState?) -> [String: Any] {
+    private static func containerInspection(
+        _ snapshot: ContainerSnapshot,
+        runtime: DockerEngineExitState?,
+        healthcheck: DockerHealthcheck?,
+        health: DockerEngineHealthSnapshot?
+    ) -> [String: Any] {
         let config = snapshot.configuration
         let process = config.initProcess
         let startedAt = snapshot.startedDate.map { ISO8601DateFormatter().string(from: $0) } ?? "0001-01-01T00:00:00Z"
@@ -699,12 +857,33 @@ struct DockerEngineRouter: Sendable {
         let mounts = config.mounts.map { mount -> [String: Any] in
             ["Type": mount.isVolume ? "volume" : (mount.isTmpfs ? "tmpfs" : "bind"), "Source": mount.source, "Destination": mount.destination, "Mode": mount.options.joined(separator: ","), "RW": !mount.options.readonly, "Propagation": "rprivate"]
         }
+        var state: [String: Any] = ["Status": stateStatus, "Running": running, "Paused": false, "Restarting": false, "OOMKilled": false, "Dead": false, "Pid": 0, "ExitCode": exitCode, "Error": "", "StartedAt": startedAt, "FinishedAt": finishedAt]
+        if let health {
+            state["Health"] = health.dockerJSON
+        }
+        var containerConfig: [String: Any] = [
+            "Hostname": config.networks.first?.options.hostname.split(separator: ".", maxSplits: 1).first.map(String.init) ?? snapshot.id,
+            "User": process.user.description,
+            "Env": env,
+            "Cmd": [process.executable] + process.arguments,
+            "Image": config.image.reference,
+            "WorkingDir": process.workingDirectory,
+            "Entrypoint": [process.executable],
+            "ExposedPorts": exposedPorts(config.publishedPorts),
+            "Labels": config.labels,
+            "Tty": process.terminal,
+            "OpenStdin": false,
+            "StopSignal": config.stopSignal ?? "SIGTERM",
+        ]
+        if let healthcheck {
+            containerConfig["Healthcheck"] = healthcheck.dockerJSON
+        }
         return [
             "Id": snapshot.id,
             "Created": ISO8601DateFormatter().string(from: config.creationDate),
             "Path": process.executable,
             "Args": process.arguments,
-            "State": ["Status": stateStatus, "Running": running, "Paused": false, "Restarting": false, "OOMKilled": false, "Dead": false, "Pid": 0, "ExitCode": exitCode, "Error": "", "StartedAt": startedAt, "FinishedAt": finishedAt],
+            "State": state,
             "Image": config.image.digest,
             "Name": "/\(snapshot.id)",
             "RestartCount": 0,
@@ -721,20 +900,7 @@ struct DockerEngineRouter: Sendable {
                 "Binds": [],
             ],
             "GraphDriver": ["Name": "containerization", "Data": [:]],
-            "Config": [
-                "Hostname": config.networks.first?.options.hostname.split(separator: ".", maxSplits: 1).first.map(String.init) ?? snapshot.id,
-                "User": process.user.description,
-                "Env": env,
-                "Cmd": [process.executable] + process.arguments,
-                "Image": config.image.reference,
-                "WorkingDir": process.workingDirectory,
-                "Entrypoint": [process.executable],
-                "ExposedPorts": exposedPorts(config.publishedPorts),
-                "Labels": config.labels,
-                "Tty": process.terminal,
-                "OpenStdin": false,
-                "StopSignal": config.stopSignal ?? "SIGTERM",
-            ],
+            "Config": containerConfig,
             "NetworkSettings": ["Networks": networkSettings(snapshot.networks, configured: config.networks, baseDomain: config.dns?.domain ?? fallbackDNSDomain), "Ports": publishedPortBindings(config.publishedPorts)],
             "Mounts": mounts,
         ]
@@ -813,7 +979,7 @@ struct DockerEngineRouter: Sendable {
                 "EndpointID": "",
                 "Gateway": attachment.ipv4Gateway.description,
                 "IPAddress": String(attachment.ipv4Address.address.description),
-                "IPPrefixLen": attachment.ipv4Address.prefixLength,
+                "IPPrefixLen": attachment.ipv4Address.prefix.length,
                 "MacAddress": attachment.macAddress?.description ?? "",
                 "Aliases": uniqueAliases,
             ] as [String: Any])
@@ -905,8 +1071,11 @@ struct DockerEngineRouter: Sendable {
     private static func validateUnsupportedCreateConfig(body: Data) throws {
         guard let request = try JSONSerialization.jsonObject(with: body) as? [String: Any] else { return }
 
-        if let healthcheck = request["Healthcheck"], hasNonDefaultValue(healthcheck, field: "Healthcheck") {
-            throw DockerAPIError.unsupported("Healthcheck はサポートされていません")
+        if let healthcheck = request["Healthcheck"] as? [String: Any] {
+            let supportedHealthcheckFields: Set<String> = ["Test", "Interval", "Timeout", "StartPeriod", "StartInterval", "Retries"]
+            for (key, value) in healthcheck where !supportedHealthcheckFields.contains(key) && hasNonDefaultValue(value, field: key) {
+                throw DockerAPIError.unsupported("Healthcheck.\(key) はサポートされていません")
+            }
         }
 
         guard let hostConfig = request["HostConfig"] as? [String: Any] else { return }
@@ -1054,6 +1223,7 @@ private struct DockerCreateRequest: Decodable {
     let labels: [String: String]?
     let tty: Bool?
     let stopSignal: String?
+    let healthcheck: DockerHealthcheck?
     let hostConfig: DockerHostConfig?
     let networkingConfig: DockerNetworkingConfig?
 
@@ -1068,8 +1238,65 @@ private struct DockerCreateRequest: Decodable {
         case labels = "Labels"
         case tty = "Tty"
         case stopSignal = "StopSignal"
+        case healthcheck = "Healthcheck"
         case hostConfig = "HostConfig"
         case networkingConfig = "NetworkingConfig"
+    }
+}
+
+private struct DockerHealthcheck: Decodable, Sendable {
+    let test: [String]?
+    let interval: Int64?
+    let timeout: Int64?
+    let startPeriod: Int64?
+    let startInterval: Int64?
+    let retries: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case test = "Test"
+        case interval = "Interval"
+        case timeout = "Timeout"
+        case startPeriod = "StartPeriod"
+        case startInterval = "StartInterval"
+        case retries = "Retries"
+    }
+
+    var isDisabled: Bool { test?.first == "NONE" }
+
+    var command: (executable: String, arguments: [String])? {
+        guard let test, let kind = test.first else { return nil }
+        switch kind {
+        case "CMD":
+            guard test.count > 1, !test[1].isEmpty else { return nil }
+            return (test[1], Array(test.dropFirst(2)))
+        case "CMD-SHELL":
+            let shellCommand = test.dropFirst().joined(separator: " ")
+            guard !shellCommand.isEmpty else { return nil }
+            return ("/bin/sh", ["-c", shellCommand])
+        default:
+            return nil
+        }
+    }
+
+    var dockerJSON: [String: Any] {
+        var result: [String: Any] = ["Test": test ?? []]
+        if let interval { result["Interval"] = interval }
+        if let timeout { result["Timeout"] = timeout }
+        if let startPeriod { result["StartPeriod"] = startPeriod }
+        if let startInterval { result["StartInterval"] = startInterval }
+        if let retries { result["Retries"] = retries }
+        return result
+    }
+
+    var intervalDuration: Duration { Self.duration(interval, default: 30_000_000_000) }
+    var timeoutDuration: Duration { Self.duration(timeout, default: 30_000_000_000) }
+    var startPeriodDuration: Duration { Self.duration(startPeriod, default: 0) }
+    var startIntervalDuration: Duration { Self.duration(startInterval, default: 5_000_000_000) }
+    var retryCount: Int { max(1, retries ?? 3) }
+
+    private static func duration(_ value: Int64?, default defaultValue: Int64) -> Duration {
+        let nanoseconds = value.flatMap { $0 > 0 ? $0 : nil } ?? defaultValue
+        return .nanoseconds(nanoseconds)
     }
 }
 
@@ -1196,23 +1423,280 @@ struct DockerEngineExitState: Sendable {
     let finishedAt: Date
 }
 
+struct DockerEngineHealthSnapshot: Sendable {
+    enum Status: String, Sendable {
+        case starting
+        case healthy
+        case unhealthy
+    }
+
+    struct Log: Sendable {
+        let startedAt: Date
+        let completedAt: Date
+        let exitCode: Int32
+        let output: String
+    }
+
+    let status: Status
+    let failingStreak: Int
+    let log: [Log]
+
+    var dockerJSON: [String: Any] {
+        [
+            "Status": status.rawValue,
+            "FailingStreak": failingStreak,
+            "Log": log.map { entry in
+                [
+                    "Start": ISO8601DateFormatter().string(from: entry.startedAt),
+                    "End": ISO8601DateFormatter().string(from: entry.completedAt),
+                    "ExitCode": entry.exitCode,
+                    "Output": entry.output,
+                ] as [String: Any]
+            },
+        ]
+    }
+}
+
+private struct DockerEngineHealthcheckConfiguration: Sendable {
+    let check: DockerHealthcheck
+    let process: ProcessConfiguration
+}
+
+private enum DockerEngineHealthcheckResult: Sendable {
+    case completed(Int32, String)
+    case timedOut(String)
+    case failed(String)
+    case cancelled
+}
+
+private final class DockerEngineHealthcheckOutput: @unchecked Sendable {
+    private static let maxBytes = 4 * 1024
+
+    let pipe = Pipe()
+    private let lock = NSLock()
+    private var data = Data()
+
+    init() {
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty else {
+                handle.readabilityHandler = nil
+                return
+            }
+            self?.append(chunk)
+        }
+    }
+
+    func finish() async -> String {
+        try? pipe.fileHandleForWriting.close()
+        try? await Task.sleep(for: .milliseconds(10))
+        pipe.fileHandleForReading.readabilityHandler = nil
+        return String(decoding: snapshot(), as: UTF8.self)
+    }
+
+    private func snapshot() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return data
+    }
+
+    private func append(_ chunk: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        let remaining = Self.maxBytes - data.count
+        if remaining > 0 {
+            data.append(contentsOf: chunk.prefix(remaining))
+        }
+    }
+}
+
 actor DockerEngineRuntimeState {
     private var exits = [String: DockerEngineExitState]()
+    private var configuredHealthchecks = [String: DockerHealthcheck]()
+    private var healthchecks = [String: DockerEngineHealthcheckConfiguration]()
+    private var healthStates = [String: DockerEngineHealthSnapshot]()
+    private var healthTasks = [String: Task<Void, Never>]()
 
     func started(id: String) {
         exits.removeValue(forKey: id)
+        healthTasks[id]?.cancel()
+        guard let healthcheck = healthchecks[id] else { return }
+        healthStates[id] = DockerEngineHealthSnapshot(status: .starting, failingStreak: 0, log: [])
+        healthTasks[id] = Task.detached { [weak self] in
+            await self?.monitorHealthcheck(id: id, configuration: healthcheck)
+        }
     }
 
     func exited(id: String, exitCode: Int32) {
         exits[id] = DockerEngineExitState(exitCode: exitCode, finishedAt: Date())
+        healthTasks.removeValue(forKey: id)?.cancel()
     }
 
     func state(id: String) -> DockerEngineExitState? {
         exits[id]
     }
 
+    fileprivate func configureHealthcheck(id: String, healthcheck: DockerHealthcheck?, process: ProcessConfiguration) {
+        if let healthcheck {
+            configuredHealthchecks[id] = healthcheck
+        } else {
+            configuredHealthchecks.removeValue(forKey: id)
+        }
+        guard let healthcheck, !healthcheck.isDisabled, let command = healthcheck.command else {
+            healthchecks.removeValue(forKey: id)
+            healthStates.removeValue(forKey: id)
+            healthTasks.removeValue(forKey: id)?.cancel()
+            return
+        }
+        healthchecks[id] = DockerEngineHealthcheckConfiguration(
+            check: healthcheck,
+            process: ProcessConfiguration(
+                executable: command.executable,
+                arguments: command.arguments,
+                environment: process.environment,
+                workingDirectory: process.workingDirectory,
+                terminal: false,
+                user: process.user,
+                supplementalGroups: process.supplementalGroups,
+                rlimits: process.rlimits
+            )
+        )
+        healthStates[id] = DockerEngineHealthSnapshot(status: .starting, failingStreak: 0, log: [])
+    }
+
+    fileprivate func healthcheck(id: String) -> DockerHealthcheck? {
+        configuredHealthchecks[id]
+    }
+
+    fileprivate func health(id: String) -> DockerEngineHealthSnapshot? {
+        healthStates[id]
+    }
+
     func removed(id: String) {
         exits.removeValue(forKey: id)
+        healthTasks.removeValue(forKey: id)?.cancel()
+        configuredHealthchecks.removeValue(forKey: id)
+        healthchecks.removeValue(forKey: id)
+        healthStates.removeValue(forKey: id)
+    }
+
+    private func monitorHealthcheck(id: String, configuration: DockerEngineHealthcheckConfiguration) async {
+        let startPeriodEnds = Date().addingTimeInterval(Self.seconds(configuration.check.startPeriodDuration))
+        while !Task.isCancelled {
+            let checkStartedAt = Date()
+            let result = await Self.runHealthcheck(id: id, configuration: configuration)
+            guard !Task.isCancelled else { return }
+
+            let current = healthStates[id] ?? DockerEngineHealthSnapshot(status: .starting, failingStreak: 0, log: [])
+            let passed: Bool
+            let output: String
+            let exitCode: Int32
+            switch result {
+            case .completed(let resultExitCode, let resultOutput):
+                exitCode = resultExitCode
+                passed = resultExitCode == 0
+                output = resultOutput
+            case .timedOut(let resultOutput):
+                passed = false
+                exitCode = -1
+                output = resultOutput.isEmpty ? "healthcheck timed out" : resultOutput
+            case .failed(let message):
+                passed = false
+                exitCode = -1
+                output = message
+            case .cancelled:
+                return
+            }
+
+            let completedAt = Date()
+            var failingStreak = current.failingStreak
+            let status: DockerEngineHealthSnapshot.Status
+            if passed {
+                failingStreak = 0
+                status = .healthy
+            } else if completedAt < startPeriodEnds && current.status != .healthy {
+                failingStreak = 0
+                status = .starting
+            } else {
+                failingStreak += 1
+                if failingStreak >= configuration.check.retryCount {
+                    status = .unhealthy
+                } else {
+                    status = current.status == .healthy ? .healthy : .starting
+                }
+            }
+            let log = (current.log + [DockerEngineHealthSnapshot.Log(
+                startedAt: checkStartedAt,
+                completedAt: completedAt,
+                exitCode: exitCode,
+                output: output
+            )]).suffix(5)
+            healthStates[id] = DockerEngineHealthSnapshot(status: status, failingStreak: failingStreak, log: Array(log))
+
+            do {
+                let interval = Date() < startPeriodEnds ? configuration.check.startIntervalDuration : configuration.check.intervalDuration
+                try await Task.sleep(for: interval)
+            } catch {
+                return
+            }
+        }
+    }
+
+    private static func runHealthcheck(id: String, configuration: DockerEngineHealthcheckConfiguration) async -> DockerEngineHealthcheckResult {
+        let client = ContainerClient()
+        let output = DockerEngineHealthcheckOutput()
+        let process: ClientProcess
+        do {
+            process = try await client.createProcess(
+                containerId: id,
+                processId: "healthcheck-\(UUID().uuidString.lowercased())",
+                configuration: configuration.process,
+                stdio: [nil, output.pipe.fileHandleForWriting, output.pipe.fileHandleForWriting]
+            )
+            try await process.start()
+        } catch {
+            let processOutput = await output.finish()
+            return .failed([processOutput, String(describing: error)].filter { !$0.isEmpty }.joined(separator: "\n"))
+        }
+
+        let result = await withTaskGroup(of: DockerEngineHealthcheckResult.self) { group in
+            group.addTask {
+                do {
+                    let exitCode = try await process.wait()
+                    return .completed(exitCode, await output.finish())
+                } catch {
+                    return .failed([await output.finish(), String(describing: error)].filter { !$0.isEmpty }.joined(separator: "\n"))
+                }
+            }
+            group.addTask {
+                do {
+                    try await Task.sleep(for: configuration.check.timeoutDuration)
+                    try? await process.kill(9)
+                    _ = try? await process.wait()
+                    let processOutput = await output.finish()
+                    return .timedOut(processOutput)
+                } catch {
+                    return .cancelled
+                }
+            }
+            let first = await group.next() ?? .failed("healthcheck process did not complete")
+            group.cancelAll()
+            switch first {
+            case .timedOut, .cancelled:
+                try? await process.kill(9)
+                _ = try? await process.wait()
+                _ = await output.finish()
+            default:
+                break
+            }
+            return first
+        }
+        return result
+    }
+
+    private static func seconds(_ duration: Duration) -> TimeInterval {
+        let components = duration.components
+        return TimeInterval(components.seconds) + TimeInterval(components.attoseconds) / 1_000_000_000_000_000_000
     }
 }
 
