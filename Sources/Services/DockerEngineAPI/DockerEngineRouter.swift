@@ -223,7 +223,7 @@ struct DockerEngineRouter: Sendable {
         for flag in ["nocache", "pull", "q", "forcerm", "rm"] {
             _ = try Self.queryFlag(query[flag], field: flag)
         }
-        if let version = query["version"], version != "2" {
+        if let version = query["version"], !["1", "2"].contains(version) {
             throw DockerAPIError.unsupported("build version \(version) はサポートされていません")
         }
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("docker-build-\(UUID().uuidString)", isDirectory: true)
@@ -406,6 +406,7 @@ struct DockerEngineRouter: Sendable {
         config.runtimeHandler = "container-runtime-linux"
         config.labels = labels
         config.stopSignal = stopSignal
+        config.useInit = host.useInit ?? false
         config.resources = try Parser.resources(
             cpus: nil,
             memory: nil,
@@ -835,7 +836,7 @@ struct DockerEngineRouter: Sendable {
             "Labels": config.labels,
             "State": state,
             "Status": status,
-            "HostConfig": ["NetworkMode": config.networks.first?.network ?? "default"],
+            "HostConfig": ["NetworkMode": config.networks.first?.network ?? "default", "Init": config.useInit],
             "NetworkSettings": ["Networks": networkSettings(snapshot.networks, configured: config.networks, baseDomain: config.dns?.domain ?? fallbackDNSDomain)],
         ]
     }
@@ -895,6 +896,7 @@ struct DockerEngineRouter: Sendable {
             "ExecIDs": NSNull(),
             "HostConfig": [
                 "NetworkMode": config.networks.first?.network ?? "default",
+                "Init": config.useInit,
                 "ReadonlyRootfs": config.readOnly,
                 "PortBindings": publishedPortBindings(config.publishedPorts),
                 "Binds": [],
@@ -1012,19 +1014,77 @@ struct DockerEngineRouter: Sendable {
 
     private static func containerFilters(_ value: String?) throws -> ContainerListFilters {
         guard let value, !value.isEmpty else { return .all }
-        let decoded = try JSONDecoder().decode([String: [String]].self, from: Data(value.utf8))
+        let filterObject: Any
+        do {
+            filterObject = try JSONSerialization.jsonObject(with: Data(value.utf8))
+        } catch {
+            throw DockerAPIError.badRequest("filters は有効な JSON である必要があります")
+        }
+        guard let decoded = filterObject as? [String: Any] else {
+            throw DockerAPIError.badRequest("filters は JSON object である必要があります")
+        }
         var labels = [String: String]()
-        for label in decoded["label"] ?? [] {
-            let parts = label.split(separator: "=", maxSplits: 1).map(String.init)
-            if parts.count == 2 {
-                labels[parts[0]] = "^\(NSRegularExpression.escapedPattern(for: parts[1]))$"
+        if let rawLabels = decoded["label"] {
+            if let labelFilters = rawLabels as? [String] {
+                for label in labelFilters {
+                    try Self.addLabelFilter(label, to: &labels)
+                }
+            } else if let labelFilter = rawLabels as? String {
+                try Self.addLabelFilter(labelFilter, to: &labels)
+            } else if let labelFilters = rawLabels as? [String: Any] {
+                for (key, rawValues) in labelFilters {
+                    if let values = rawValues as? [String] {
+                        if values.isEmpty {
+                            labels[key] = ".+"
+                        } else {
+                            for value in values {
+                                try Self.addLabelFilter("\(key)=\(value)", to: &labels)
+                            }
+                        }
+                    } else if let value = rawValues as? String {
+                        try Self.addLabelFilter("\(key)=\(value)", to: &labels)
+                    } else if let values = rawValues as? [String: Any] {
+                        for (value, includeValue) in values {
+                            guard let includeValue = includeValue as? Bool else {
+                                throw DockerAPIError.badRequest("filters.label object の各値は boolean である必要があります")
+                            }
+                            try Self.addLabelFilter("\(key)=\(value)", to: &labels, include: includeValue)
+                        }
+                    } else if let include = rawValues as? Bool {
+                        try Self.addLabelFilter(key, to: &labels, include: include)
+                    } else {
+                        throw DockerAPIError.badRequest("filters.label の値は文字列または文字列配列である必要があります")
+                    }
+                }
             } else {
-                labels[label] = ".*"
+                throw DockerAPIError.badRequest("filters.label は文字列配列または object である必要があります")
             }
         }
-        let statuses = decoded["status"] ?? []
+        let statuses = try Self.stringFilterValues(decoded["status"], field: "status")
         let status: RuntimeStatus? = statuses.contains("running") ? .running : (statuses.contains("exited") || statuses.contains("stopped") ? .stopped : nil)
         return ContainerListFilters(status: status, labels: labels)
+    }
+
+    private static func stringFilterValues(_ value: Any?, field: String) throws -> [String] {
+        guard let value else { return [] }
+        if let values = value as? [String] { return values }
+        if let singleValue = value as? String { return [singleValue] }
+        throw DockerAPIError.badRequest("filters.\(field) は文字列配列である必要があります")
+    }
+
+    private static func addLabelFilter(_ value: String, to labels: inout [String: String], include: Bool = true) throws {
+        let parts = value.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+        guard let key = parts.first, !key.isEmpty else {
+            throw DockerAPIError.badRequest("filters.label に空のキーは指定できません")
+        }
+        if parts.count == 2 {
+            let expectedValue = NSRegularExpression.escapedPattern(for: parts[1])
+            let pattern = include ? "^\(expectedValue)$" : ContainerListFilters.exclude(expectedValue)
+            labels[key] = labels[key].map { "(?:\($0))|(?:\(pattern))" } ?? pattern
+        } else {
+            let pattern = include ? ".+" : "^$"
+            labels[key] = labels[key].map { "(?:\($0))|(?:\(pattern))" } ?? pattern
+        }
     }
 
     private static func qualify(_ name: String, domain: String?) -> String {
@@ -1082,7 +1142,7 @@ struct DockerEngineRouter: Sendable {
 
         let supported: Set<String> = [
             "Binds", "Mounts", "PortBindings", "NetworkMode", "Memory", "NanoCpus",
-            "ReadonlyRootfs", "ShmSize", "Dns", "DnsSearch", "DnsOptions", "Sysctls", "Tmpfs",
+            "ReadonlyRootfs", "ShmSize", "Dns", "DnsSearch", "DnsOptions", "Sysctls", "Tmpfs", "Init",
         ]
         for (key, value) in hostConfig where !supported.contains(key) && hasNonDefaultValue(value, field: key) {
             throw DockerAPIError.unsupported("HostConfig.\(key) が指定されていますが、この API ではサポートされていません")
@@ -1308,6 +1368,7 @@ private struct DockerHostConfig: Decodable {
     let memory: Int64?
     let nanoCPUs: Int64?
     let readonlyRootfs: Bool?
+    let useInit: Bool?
     let shmSize: Int64?
     let dns: [String]?
     let dnsSearch: [String]?
@@ -1323,6 +1384,7 @@ private struct DockerHostConfig: Decodable {
         memory = nil
         nanoCPUs = nil
         readonlyRootfs = nil
+        useInit = nil
         shmSize = nil
         dns = nil
         dnsSearch = nil
@@ -1339,6 +1401,7 @@ private struct DockerHostConfig: Decodable {
         case memory = "Memory"
         case nanoCPUs = "NanoCpus"
         case readonlyRootfs = "ReadonlyRootfs"
+        case useInit = "Init"
         case shmSize = "ShmSize"
         case dns = "Dns"
         case dnsSearch = "DnsSearch"
