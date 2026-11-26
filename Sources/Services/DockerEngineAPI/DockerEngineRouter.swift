@@ -203,7 +203,7 @@ struct DockerEngineRouter: Sendable {
 
     private func createContainer(query: [String: String], body: Data) async throws -> DockerEngineResponse {
         let request = try JSONDecoder().decode(DockerCreateRequest.self, from: body)
-        try Self.validateUnsupportedHostConfig(body: body)
+        try Self.validateUnsupportedCreateConfig(body: body)
         guard !request.image.isEmpty else {
             throw DockerAPIError.badRequest("コンテナ作成時には Image が必要です")
         }
@@ -902,12 +902,14 @@ struct DockerEngineRouter: Sendable {
         return String(name.dropLast(suffix.count))
     }
 
-    private static func validateUnsupportedHostConfig(body: Data) throws {
-        guard let request = try JSONSerialization.jsonObject(with: body) as? [String: Any],
-            let hostConfig = request["HostConfig"] as? [String: Any]
-        else {
-            return
+    private static func validateUnsupportedCreateConfig(body: Data) throws {
+        guard let request = try JSONSerialization.jsonObject(with: body) as? [String: Any] else { return }
+
+        if let healthcheck = request["Healthcheck"], hasNonDefaultValue(healthcheck, field: "Healthcheck") {
+            throw DockerAPIError.unsupported("Healthcheck はサポートされていません")
         }
+
+        guard let hostConfig = request["HostConfig"] as? [String: Any] else { return }
 
         let supported: Set<String> = [
             "Binds", "Mounts", "PortBindings", "NetworkMode", "Memory", "NanoCpus",
