@@ -39,7 +39,7 @@ struct DockerEngineRouter: Sendable {
     let log: Logger
     let runtimeState: DockerEngineRuntimeState
 
-    func handle(method: HTTPMethod, uri: String, headers: HTTPHeaders, body: Data) async -> DockerEngineResponse {
+    func handle(method: HTTPMethod, uri: String, headers: HTTPHeaders, body: Data, buildArchive: URL? = nil) async -> DockerEngineResponse {
         guard let components = URLComponents(string: uri) else {
             return Self.error(.badRequest, "不正なリクエスト URI です")
         }
@@ -76,7 +76,7 @@ struct DockerEngineRouter: Sendable {
                 return try await listContainers(query: query)
             }
             if method == .POST && path == "/build" {
-                return try await buildImage(queryItems: components.queryItems ?? [], body: body)
+                return try await buildImage(queryItems: components.queryItems ?? [], body: body, archiveURL: buildArchive)
             }
             if method == .POST && path == "/containers/create" {
                 return try await createContainer(query: query, body: body)
@@ -105,7 +105,13 @@ struct DockerEngineRouter: Sendable {
             if pathParts.count == 2 && pathParts[0] == "containers" {
                 let id = pathParts[1]
                 if method == .DELETE {
-                    try await ContainerClient().delete(id: id, force: query["force"] == "1" || query["force"] == "true")
+                    await runtimeState.preventRestart(id: id)
+                    do {
+                        try await ContainerClient().delete(id: id, force: query["force"] == "1" || query["force"] == "true")
+                    } catch {
+                        await runtimeState.allowRestart(id: id)
+                        throw error
+                    }
                     await runtimeState.removed(id: id)
                     return DockerEngineResponse(status: .noContent)
                 }
@@ -204,21 +210,46 @@ struct DockerEngineRouter: Sendable {
             snapshots = snapshots.filter { $0.status == .running }
         }
         let summaries = await snapshots.asyncMap { snapshot in
-            Self.containerSummary(snapshot, health: await runtimeState.health(id: snapshot.id))
+            Self.containerSummary(
+                snapshot,
+                health: await runtimeState.health(id: snapshot.id),
+                restartPolicy: await runtimeState.restartPolicy(id: snapshot.id),
+                restartCount: await runtimeState.restartCount(id: snapshot.id)
+            )
         }
         return try Self.json(.ok, summaries)
     }
 
-    private func buildImage(queryItems: [URLQueryItem], body: Data) async throws -> DockerEngineResponse {
-        guard !body.isEmpty else {
+    private func buildImage(queryItems: [URLQueryItem], body: Data, archiveURL: URL?) async throws -> DockerEngineResponse {
+        guard archiveURL != nil || !body.isEmpty else {
             throw DockerAPIError.badRequest("Docker build context が空です")
         }
         let query = Dictionary(queryItems.compactMap { item in item.value.map { (item.name, $0) } }, uniquingKeysWith: { _, newest in newest })
         let supportedBuildOptions: Set<String> = [
             "dockerfile", "t", "buildargs", "labels", "target", "nocache", "pull", "q", "forcerm", "rm", "platform", "ssh", "version",
+            "remote", "cachefrom", "memory", "memswap", "cpushares", "cpusetcpus", "cpuperiod", "cpuquota", "shmsize", "squash", "networkmode", "extrahosts",
         ]
         for item in queryItems where !supportedBuildOptions.contains(item.name) && !(item.value ?? "").isEmpty {
             throw DockerAPIError.unsupported("build option \(item.name) はサポートされていません")
+        }
+        let unsupportedBuildOptionDefaults: [String: Set<String>] = [
+            "remote": [""],
+            "cachefrom": ["", "[]"],
+            "memory": ["", "0"],
+            "memswap": ["", "0"],
+            "cpushares": ["", "0"],
+            "cpusetcpus": [""],
+            "cpuperiod": ["", "0"],
+            "cpuquota": ["", "0"],
+            "shmsize": ["", "0", "67108864"],
+            "squash": ["", "0", "false"],
+            "networkmode": ["", "default"],
+            "extrahosts": ["", "[]"],
+        ]
+        for item in queryItems {
+            if let acceptedValues = unsupportedBuildOptionDefaults[item.name], !acceptedValues.contains(item.value ?? "") {
+                throw DockerAPIError.unsupported("build option \(item.name) は指定された値ではサポートされていません")
+            }
         }
         for flag in ["nocache", "pull", "q", "forcerm", "rm"] {
             _ = try Self.queryFlag(query[flag], field: flag)
@@ -228,10 +259,15 @@ struct DockerEngineRouter: Sendable {
         }
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("docker-build-\(UUID().uuidString)", isDirectory: true)
         let context = root.appendingPathComponent("context", isDirectory: true)
-        let archive = root.appendingPathComponent("context.tar")
         try FileManager.default.createDirectory(at: context, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
-        try body.write(to: archive, options: .atomic)
+        let archive: URL
+        if let archiveURL {
+            archive = archiveURL
+        } else {
+            archive = root.appendingPathComponent("context.tar")
+            try body.write(to: archive, options: .atomic)
+        }
 
         do {
             let reader = try ArchiveReader(file: archive)
@@ -313,7 +349,8 @@ struct DockerEngineRouter: Sendable {
 
         let image = try await ClientImage.get(reference: resultTag, containerSystemConfig: containerSystemConfig)
         let imageID = image.digest.hasPrefix("sha256:") ? image.digest : "sha256:\(image.digest)"
-        var response = try JSONSerialization.data(withJSONObject: ["stream": "Successfully built \(resultTag)\n"])
+        let shortImageID = String(imageID.dropFirst("sha256:".count).prefix(12))
+        var response = try JSONSerialization.data(withJSONObject: ["stream": "Successfully built \(shortImageID)\n"])
         response.append(0x0A)
         response.append(try JSONSerialization.data(withJSONObject: ["aux": ["ID": imageID]]))
         response.append(0x0A)
@@ -353,6 +390,16 @@ struct DockerEngineRouter: Sendable {
         if request.healthcheck?.isDisabled == true, request.healthcheck?.test?.count != 1 {
             throw DockerAPIError.badRequest("Healthcheck.Test の NONE には他の値を指定できません")
         }
+        let restartPolicy = request.hostConfig?.restartPolicy ?? DockerRestartPolicy()
+        guard ["no", "always", "unless-stopped", "on-failure"].contains(restartPolicy.normalizedName) else {
+            throw DockerAPIError.badRequest("HostConfig.RestartPolicy.Name が不正です")
+        }
+        guard restartPolicy.maximumRetryCount >= 0 else {
+            throw DockerAPIError.badRequest("HostConfig.RestartPolicy.MaximumRetryCount は 0 以上である必要があります")
+        }
+        if restartPolicy.normalizedName != "on-failure", restartPolicy.maximumRetryCount != 0 {
+            throw DockerAPIError.badRequest("MaximumRetryCount は on-failure の場合のみ指定できます")
+        }
         guard !request.image.isEmpty else {
             throw DockerAPIError.badRequest("コンテナ作成時には Image が必要です")
         }
@@ -390,6 +437,7 @@ struct DockerEngineRouter: Sendable {
         let kernel = try await ClientKernel.getDefaultKernel(for: .current)
         try await ContainerClient().create(configuration: config, options: .default, kernel: kernel)
         await runtimeState.configureHealthcheck(id: id, healthcheck: request.healthcheck, process: process)
+        await runtimeState.configureRestartPolicy(id: id, policy: restartPolicy)
         return try Self.json(.created, ["Id": id, "Warnings": []] as [String: Any])
     }
 
@@ -594,21 +642,51 @@ struct DockerEngineRouter: Sendable {
     }
 
     private func startContainer(id: String) async throws {
-        let client = ContainerClient()
-        let process = try await client.bootstrap(id: id, stdio: [nil, nil, nil])
-        try await process.start()
-        await runtimeState.started(id: id)
-        let runtimeState = self.runtimeState
-        Task {
-            if let exitCode = try? await process.wait() {
-                await runtimeState.exited(id: id, exitCode: exitCode)
+        await runtimeState.preventRestart(id: id)
+        do {
+            let process = try await ContainerClient().bootstrap(id: id, stdio: [nil, nil, nil])
+            try await process.start()
+            await runtimeState.started(id: id)
+            Task {
+                await monitorContainerExit(id: id, process: process)
+            }
+        } catch {
+            await runtimeState.allowRestart(id: id)
+            throw error
+        }
+    }
+
+    private func monitorContainerExit(id: String, process: ClientProcess) async {
+        var process = process
+        while let exitCode = try? await process.wait() {
+            guard let plan = await runtimeState.exited(id: id, exitCode: exitCode) else { return }
+            while true {
+                do {
+                    try await Task.sleep(for: plan.delay)
+                    guard await runtimeState.beginRestart(id: id, generation: plan.generation) else { return }
+                    let nextProcess = try await ContainerClient().bootstrap(id: id, stdio: [nil, nil, nil])
+                    guard await runtimeState.restartIsCurrent(id: id, generation: plan.generation) else { return }
+                    try await nextProcess.start()
+                    await runtimeState.started(id: id, automaticRestart: true)
+                    process = nextProcess
+                    break
+                } catch {
+                    await runtimeState.restartFailed(id: id, generation: plan.generation)
+                    if Task.isCancelled { return }
+                }
             }
         }
     }
 
     private func stopContainer(id: String, timeout: String?) async throws {
         let seconds = timeout.flatMap(Int32.init) ?? ContainerStopOptions.default.timeoutInSeconds
-        try await ContainerClient().stop(id: id, opts: ContainerStopOptions(timeoutInSeconds: seconds, signal: nil))
+        await runtimeState.preventRestart(id: id)
+        do {
+            try await ContainerClient().stop(id: id, opts: ContainerStopOptions(timeoutInSeconds: seconds, signal: nil))
+        } catch {
+            await runtimeState.allowRestart(id: id)
+            throw error
+        }
     }
 
     private func inspectContainer(id: String) async throws -> DockerEngineResponse {
@@ -616,7 +694,12 @@ struct DockerEngineRouter: Sendable {
         let runtime = await runtimeState.state(id: id)
         let healthcheck = await runtimeState.healthcheck(id: id)
         let health = await runtimeState.health(id: id)
-        return try Self.json(.ok, Self.containerInspection(snapshot, runtime: runtime, healthcheck: healthcheck, health: health))
+        let restartPolicy = await runtimeState.restartPolicy(id: id)
+        let restartCount = await runtimeState.restartCount(id: id)
+        return try Self.json(
+            .ok,
+            Self.containerInspection(snapshot, runtime: runtime, healthcheck: healthcheck, health: health, restartPolicy: restartPolicy, restartCount: restartCount)
+        )
     }
 
     private func containerLogs(id: String, query: [String: String]) async throws -> DockerEngineResponse {
@@ -820,7 +903,12 @@ struct DockerEngineRouter: Sendable {
         return try Self.json(.ok, Self.volumeInspection(volume))
     }
 
-    private static func containerSummary(_ snapshot: ContainerSnapshot, health: DockerEngineHealthSnapshot?) -> [String: Any] {
+    private static func containerSummary(
+        _ snapshot: ContainerSnapshot,
+        health: DockerEngineHealthSnapshot?,
+        restartPolicy: DockerRestartPolicy,
+        restartCount: Int
+    ) -> [String: Any] {
         let config = snapshot.configuration
         let process = config.initProcess
         let state = snapshot.status == .running ? "running" : (snapshot.startedDate == nil ? "created" : "exited")
@@ -836,7 +924,12 @@ struct DockerEngineRouter: Sendable {
             "Labels": config.labels,
             "State": state,
             "Status": status,
-            "HostConfig": ["NetworkMode": config.networks.first?.network ?? "default", "Init": config.useInit],
+            "HostConfig": [
+                "NetworkMode": config.networks.first?.network ?? "default",
+                "Init": config.useInit,
+                "RestartPolicy": restartPolicy.dockerJSON,
+            ],
+            "RestartCount": restartCount,
             "NetworkSettings": ["Networks": networkSettings(snapshot.networks, configured: config.networks, baseDomain: config.dns?.domain ?? fallbackDNSDomain)],
         ]
     }
@@ -845,7 +938,9 @@ struct DockerEngineRouter: Sendable {
         _ snapshot: ContainerSnapshot,
         runtime: DockerEngineExitState?,
         healthcheck: DockerHealthcheck?,
-        health: DockerEngineHealthSnapshot?
+        health: DockerEngineHealthSnapshot?,
+        restartPolicy: DockerRestartPolicy,
+        restartCount: Int
     ) -> [String: Any] {
         let config = snapshot.configuration
         let process = config.initProcess
@@ -887,7 +982,7 @@ struct DockerEngineRouter: Sendable {
             "State": state,
             "Image": config.image.digest,
             "Name": "/\(snapshot.id)",
-            "RestartCount": 0,
+            "RestartCount": restartCount,
             "Driver": "containerization",
             "Platform": "linux",
             "MountLabel": "",
@@ -900,6 +995,7 @@ struct DockerEngineRouter: Sendable {
                 "ReadonlyRootfs": config.readOnly,
                 "PortBindings": publishedPortBindings(config.publishedPorts),
                 "Binds": [],
+                "RestartPolicy": restartPolicy.dockerJSON,
             ],
             "GraphDriver": ["Name": "containerization", "Data": [:]],
             "Config": containerConfig,
@@ -1142,10 +1238,17 @@ struct DockerEngineRouter: Sendable {
 
         let supported: Set<String> = [
             "Binds", "Mounts", "PortBindings", "NetworkMode", "Memory", "NanoCpus",
-            "ReadonlyRootfs", "ShmSize", "Dns", "DnsSearch", "DnsOptions", "Sysctls", "Tmpfs", "Init",
+            "ReadonlyRootfs", "ShmSize", "Dns", "DnsSearch", "DnsOptions", "Sysctls", "Tmpfs", "Init", "RestartPolicy",
         ]
         for (key, value) in hostConfig where !supported.contains(key) && hasNonDefaultValue(value, field: key) {
             throw DockerAPIError.unsupported("HostConfig.\(key) が指定されていますが、この API ではサポートされていません")
+        }
+
+        if let restartPolicy = hostConfig["RestartPolicy"] as? [String: Any] {
+            let supportedRestartPolicyFields: Set<String> = ["Name", "MaximumRetryCount"]
+            for (key, value) in restartPolicy where !supportedRestartPolicyFields.contains(key) && hasNonDefaultValue(value, field: key) {
+                throw DockerAPIError.unsupported("HostConfig.RestartPolicy.\(key) はサポートされていません")
+            }
         }
 
         if let mounts = hostConfig["Mounts"] as? [[String: Any]] {
@@ -1375,6 +1478,7 @@ private struct DockerHostConfig: Decodable {
     let dnsOptions: [String]?
     let sysctls: [String: String]?
     let tmpfs: [String: String]?
+    let restartPolicy: DockerRestartPolicy?
 
     init() {
         binds = nil
@@ -1391,6 +1495,7 @@ private struct DockerHostConfig: Decodable {
         dnsOptions = nil
         sysctls = nil
         tmpfs = nil
+        restartPolicy = nil
     }
 
     enum CodingKeys: String, CodingKey {
@@ -1408,6 +1513,34 @@ private struct DockerHostConfig: Decodable {
         case dnsOptions = "DnsOptions"
         case sysctls = "Sysctls"
         case tmpfs = "Tmpfs"
+        case restartPolicy = "RestartPolicy"
+    }
+}
+
+private struct DockerRestartPolicy: Decodable, Sendable {
+    let name: String
+    let maximumRetryCount: Int
+
+    init(name: String = "no", maximumRetryCount: Int = 0) {
+        self.name = name
+        self.maximumRetryCount = maximumRetryCount
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case name = "Name"
+        case maximumRetryCount = "MaximumRetryCount"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decodeIfPresent(String.self, forKey: .name) ?? "no"
+        maximumRetryCount = try container.decodeIfPresent(Int.self, forKey: .maximumRetryCount) ?? 0
+    }
+
+    var normalizedName: String { name.isEmpty ? "no" : name }
+
+    var dockerJSON: [String: Any] {
+        ["Name": normalizedName, "MaximumRetryCount": maximumRetryCount]
     }
 }
 
@@ -1520,6 +1653,11 @@ struct DockerEngineHealthSnapshot: Sendable {
     }
 }
 
+private struct DockerEngineRestartPlan: Sendable {
+    let delay: Duration
+    let generation: Int
+}
+
 private struct DockerEngineHealthcheckConfiguration: Sendable {
     let check: DockerHealthcheck
     let process: ProcessConfiguration
@@ -1575,13 +1713,27 @@ private final class DockerEngineHealthcheckOutput: @unchecked Sendable {
 
 actor DockerEngineRuntimeState {
     private var exits = [String: DockerEngineExitState]()
+    private var restartPolicies = [String: DockerRestartPolicy]()
+    private var restartAttempts = [String: Int]()
+    private var restartCounts = [String: Int]()
+    private var generations = [String: Int]()
+    private var manuallyStopped = Set<String>()
+    private var restarting = Set<String>()
     private var configuredHealthchecks = [String: DockerHealthcheck]()
     private var healthchecks = [String: DockerEngineHealthcheckConfiguration]()
     private var healthStates = [String: DockerEngineHealthSnapshot]()
     private var healthTasks = [String: Task<Void, Never>]()
 
-    func started(id: String) {
+    func started(id: String, automaticRestart: Bool = false) {
         exits.removeValue(forKey: id)
+        generations[id, default: 0] += 1
+        restarting.remove(id)
+        if automaticRestart {
+            restartCounts[id, default: 0] += 1
+        } else {
+            manuallyStopped.remove(id)
+            restartAttempts[id] = 0
+        }
         healthTasks[id]?.cancel()
         guard let healthcheck = healthchecks[id] else { return }
         healthStates[id] = DockerEngineHealthSnapshot(status: .starting, failingStreak: 0, log: [])
@@ -1590,13 +1742,74 @@ actor DockerEngineRuntimeState {
         }
     }
 
-    func exited(id: String, exitCode: Int32) {
+    fileprivate func exited(id: String, exitCode: Int32) -> DockerEngineRestartPlan? {
         exits[id] = DockerEngineExitState(exitCode: exitCode, finishedAt: Date())
         healthTasks.removeValue(forKey: id)?.cancel()
+        guard !manuallyStopped.contains(id), let policy = restartPolicies[id] else { return nil }
+        let shouldRestart: Bool
+        switch policy.normalizedName {
+        case "always", "unless-stopped":
+            shouldRestart = true
+        case "on-failure":
+            shouldRestart = exitCode != 0
+        default:
+            shouldRestart = false
+        }
+        guard shouldRestart else { return nil }
+        let attempts = restartAttempts[id, default: 0]
+        if policy.normalizedName == "on-failure", policy.maximumRetryCount > 0, attempts >= policy.maximumRetryCount {
+            return nil
+        }
+        restartAttempts[id] = attempts + 1
+        let backoff = min(100 * (1 << min(attempts, 9)), 60_000)
+        return DockerEngineRestartPlan(delay: .milliseconds(backoff), generation: generations[id, default: 0])
     }
 
     func state(id: String) -> DockerEngineExitState? {
         exits[id]
+    }
+
+    fileprivate func configureRestartPolicy(id: String, policy: DockerRestartPolicy) {
+        generations[id, default: 0] += 1
+        manuallyStopped.remove(id)
+        restartAttempts[id] = 0
+        restartCounts[id] = 0
+        restartPolicies[id] = policy
+    }
+
+    fileprivate func restartPolicy(id: String) -> DockerRestartPolicy {
+        restartPolicies[id] ?? DockerRestartPolicy()
+    }
+
+    func restartCount(id: String) -> Int {
+        restartCounts[id, default: 0]
+    }
+
+    func preventRestart(id: String) {
+        manuallyStopped.insert(id)
+        restarting.remove(id)
+    }
+
+    func allowRestart(id: String) {
+        manuallyStopped.remove(id)
+    }
+
+    func beginRestart(id: String, generation: Int) -> Bool {
+        guard restartPolicies[id] != nil,
+            generations[id, default: 0] == generation,
+            !manuallyStopped.contains(id), !restarting.contains(id)
+        else { return false }
+        restarting.insert(id)
+        return true
+    }
+
+    func restartIsCurrent(id: String, generation: Int) -> Bool {
+        restartPolicies[id] != nil && generations[id, default: 0] == generation && !manuallyStopped.contains(id) && restarting.contains(id)
+    }
+
+    func restartFailed(id: String, generation: Int) {
+        guard generations[id, default: 0] == generation else { return }
+        restarting.remove(id)
     }
 
     fileprivate func configureHealthcheck(id: String, healthcheck: DockerHealthcheck?, process: ProcessConfiguration) {
@@ -1637,6 +1850,12 @@ actor DockerEngineRuntimeState {
 
     func removed(id: String) {
         exits.removeValue(forKey: id)
+        generations[id, default: 0] += 1
+        restartPolicies.removeValue(forKey: id)
+        restartAttempts.removeValue(forKey: id)
+        restartCounts.removeValue(forKey: id)
+        manuallyStopped.insert(id)
+        restarting.remove(id)
         healthTasks.removeValue(forKey: id)?.cancel()
         configuredHealthchecks.removeValue(forKey: id)
         healthchecks.removeValue(forKey: id)

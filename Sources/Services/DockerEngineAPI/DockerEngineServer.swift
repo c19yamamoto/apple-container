@@ -25,7 +25,7 @@ typealias DockerHTTPConnection = NIOAsyncChannel<HTTPServerRequestPart, HTTPServ
 typealias DockerHTTPWriter = NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>
 
 private let maxDockerRequestBodyBytes = 16 * 1024 * 1024
-private let maxDockerBuildContextBytes = 256 * 1024 * 1024
+private let maxDockerBuildContextBytes = 1024 * 1024 * 1024
 
 public struct DockerEngineListener: Sendable {
     fileprivate let channel: NIOAsyncChannel<DockerHTTPConnection, Never>
@@ -73,7 +73,7 @@ public struct DockerEngineServer: Sendable {
         let server = try await ServerBootstrap(group: NIOSingletons.posixEventLoopGroup)
             .bind(unixDomainSocketPath: socketPath, cleanupExistingSocketFile: true) { channel in
                 channel.eventLoop.makeCompletedFuture {
-                    try channel.pipeline.syncOperations.configureHTTPServerPipeline()
+                    try channel.pipeline.syncOperations.configureHTTPServerPipeline(withPipeliningAssistance: false)
                     return try DockerHTTPConnection(wrappingChannelSynchronously: channel)
                 }
             }
@@ -90,33 +90,107 @@ public struct DockerEngineServer: Sendable {
                 var head: HTTPRequestHead?
                 var body = Data()
                 var maxBodyBytes = maxDockerRequestBodyBytes
+                var requestBodyBytes = 0
+                var buildArchiveRoot: URL?
+                var buildArchiveURL: URL?
+                var buildArchiveHandle: FileHandle?
+                defer {
+                    try? buildArchiveHandle?.close()
+                    if let buildArchiveRoot {
+                        try? FileManager.default.removeItem(at: buildArchiveRoot)
+                    }
+                }
                 for try await part in inbound {
                     switch part {
                     case .head(let requestHead):
+                        try? buildArchiveHandle?.close()
+                        buildArchiveHandle = nil
+                        if let buildArchiveRoot {
+                            try? FileManager.default.removeItem(at: buildArchiveRoot)
+                        }
+                        buildArchiveRoot = nil
+                        buildArchiveURL = nil
                         head = requestHead
                         body.removeAll(keepingCapacity: true)
+                        requestBodyBytes = 0
                         maxBodyBytes = Self.maxRequestBodyBytes(for: requestHead)
-                    case .body(let buffer):
-                        guard body.count + buffer.readableBytes <= maxBodyBytes else {
+                        if let contentLength = requestHead.headers.first(name: "content-length").flatMap({ Int64($0) }), contentLength > Int64(maxBodyBytes) {
                             try await Self.write(DockerEngineResponse(status: .payloadTooLarge), outbound: outbound)
                             connection.channel.close(promise: nil)
                             return
                         }
+                        if Self.expectsContinue(requestHead) {
+                            try await outbound.write(.head(HTTPResponseHead(version: requestHead.version, status: .continue)))
+                            try await outbound.write(.end(nil))
+                        }
+                        if Self.isBuildRequest(requestHead) {
+                            let root = FileManager.default.temporaryDirectory
+                                .appendingPathComponent("docker-engine-build-\(UUID().uuidString)", isDirectory: true)
+                            do {
+                                try FileManager.default.createDirectory(
+                                    at: root,
+                                    withIntermediateDirectories: false,
+                                    attributes: [.posixPermissions: 0o700]
+                                )
+                                let archive = root.appendingPathComponent("context.tar")
+                                guard FileManager.default.createFile(
+                                    atPath: archive.path,
+                                    contents: nil,
+                                    attributes: [.posixPermissions: 0o600]
+                                ) else {
+                                    throw CocoaError(.fileWriteUnknown)
+                                }
+                                buildArchiveHandle = try FileHandle(forWritingTo: archive)
+                                buildArchiveRoot = root
+                                buildArchiveURL = archive
+                            } catch {
+                                try? FileManager.default.removeItem(at: root)
+                                try await Self.write(DockerEngineResponse(status: .internalServerError), outbound: outbound)
+                                connection.channel.close(promise: nil)
+                                return
+                            }
+                        }
+                    case .body(let buffer):
+                        guard requestBodyBytes + buffer.readableBytes <= maxBodyBytes else {
+                            try await Self.write(DockerEngineResponse(status: .payloadTooLarge), outbound: outbound)
+                            connection.channel.close(promise: nil)
+                            return
+                        }
+                        requestBodyBytes += buffer.readableBytes
                         if let bytes = buffer.getBytes(at: buffer.readerIndex, length: buffer.readableBytes) {
-                            body.append(contentsOf: bytes)
+                            if let buildArchiveHandle {
+                                do {
+                                    try buildArchiveHandle.write(contentsOf: Data(bytes))
+                                } catch {
+                                    try await Self.write(DockerEngineResponse(status: .internalServerError), outbound: outbound)
+                                    connection.channel.close(promise: nil)
+                                    return
+                                }
+                            } else {
+                                body.append(contentsOf: bytes)
+                            }
                         }
                     case .end:
                         if let requestHead = head {
+                            try? buildArchiveHandle?.close()
+                            buildArchiveHandle = nil
                             let response = await router.handle(
                                 method: requestHead.method,
                                 uri: requestHead.uri,
                                 headers: requestHead.headers,
-                                body: body
+                                body: body,
+                                buildArchive: buildArchiveURL
                             )
                             try await Self.write(response, outbound: outbound)
                         }
                         head = nil
                         body.removeAll(keepingCapacity: true)
+                        requestBodyBytes = 0
+                        if let buildArchiveRoot {
+                            try? FileManager.default.removeItem(at: buildArchiveRoot)
+                        }
+                        buildArchiveRoot = nil
+                        buildArchiveURL = nil
                     }
                 }
             }
@@ -126,16 +200,22 @@ public struct DockerEngineServer: Sendable {
     }
 
     private static func maxRequestBodyBytes(for request: HTTPRequestHead) -> Int {
-        guard request.method == .POST,
-            let path = URLComponents(string: request.uri)?.path
-        else {
-            return maxDockerRequestBodyBytes
-        }
+        isBuildRequest(request) ? maxDockerBuildContextBytes : maxDockerRequestBodyBytes
+    }
+
+    private static func isBuildRequest(_ request: HTTPRequestHead) -> Bool {
+        guard request.method == .POST, let path = URLComponents(string: request.uri)?.path else { return false }
         let parts = path.split(separator: "/")
         let endpointParts = parts.first?.range(of: #"^v\d+\.\d+$"#, options: .regularExpression) != nil
             ? parts.dropFirst()
             : parts[...]
-        return endpointParts.elementsEqual(["build"]) ? maxDockerBuildContextBytes : maxDockerRequestBodyBytes
+        return endpointParts.elementsEqual(["build"])
+    }
+
+    private static func expectsContinue(_ request: HTTPRequestHead) -> Bool {
+        request.headers["expect"].contains { value in
+            value.split(separator: ",").contains { $0.trimmingCharacters(in: .whitespaces).lowercased() == "100-continue" }
+        }
     }
 
     private static func write(_ response: DockerEngineResponse, outbound: DockerHTTPWriter) async throws {
