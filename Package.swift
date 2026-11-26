@@ -255,6 +255,22 @@ let package = Package(
             ],
             path: "Sources/Services/ClusterHostStoreService"
         ),
+        .target(
+            name: "DockerEngineAPI",
+            dependencies: [
+                .product(name: "Logging", package: "swift-log"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "Containerization", package: "containerization"),
+                .product(name: "ContainerizationOCI", package: "containerization"),
+                .product(name: "ContainerizationExtras", package: "containerization"),
+                "ContainerAPIClient",
+                "ContainerPersistence",
+                "ContainerResource",
+            ],
+            path: "Sources/Services/DockerEngineAPI"
+        ),
         .testTarget(
             name: "ClusterHostStoreTests",
             dependencies: [
@@ -279,6 +295,7 @@ let package = Package(
                 .product(name: "SystemPackage", package: "swift-system"),
                 "ContainerAPIService",
                 "ContainerAPIClient",
+                "DockerEngineAPI",
                 "ContainerLog",
                 "ContainerNetworkClient",
                 "ContainerPersistence",

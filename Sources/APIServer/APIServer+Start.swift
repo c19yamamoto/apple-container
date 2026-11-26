@@ -23,6 +23,7 @@ import ContainerPlugin
 import ContainerResource
 import ContainerXPC
 import ContainerizationExtras
+import DockerEngineAPI
 import DNSServer
 import Foundation
 import Logging
@@ -96,11 +97,28 @@ extension APIServer {
                             $0[$1.key.rawValue] = $1.value
                         }), log: log)
 
+                let dockerSocket = appRoot.appending(FilePath.Component("docker.sock")).string
+                let dockerEngineServer = DockerEngineServer(
+                    socketPath: dockerSocket,
+                    containerSystemConfig: containerSystemConfig,
+                    log: log
+                )
+                let dockerListener = try await dockerEngineServer.bind()
+
                 await withTaskGroup(of: Result<Void, Error>.self) { group in
                     group.addTask {
                         log.info("starting XPC server")
                         do {
                             try await server.listen()
+                            return .success(())
+                        } catch {
+                            return .failure(error)
+                        }
+                    }
+
+                    group.addTask {
+                        do {
+                            try await dockerEngineServer.run(listener: dockerListener)
                             return .success(())
                         } catch {
                             return .failure(error)

@@ -41,6 +41,19 @@ This pulls the `alpine` image, runs it in a lightweight Linux VM, prints `hello`
 removes the container when it exits. See the [tutorial](./docs/tutorials/start-here.md)
 for a fuller walkthrough that builds and publishes an image of your own.
 
+### Docker Compose
+
+`container system start` also starts a Docker Engine API compatibility socket for Docker CLI and Compose. Point `DOCKER_HOST` at the socket before running Compose:
+
+```bash
+container system start
+export DOCKER_HOST="unix://$HOME/Library/Application Support/com.apple.container/docker.sock"
+docker compose up --detach
+docker compose down
+```
+
+The current API supports image pull and inspection, detached container lifecycle, and Compose-managed networks and volumes. Image builds, interactive attach, exec, log following, host networking, and automatically assigned host ports are not supported by this compatibility API.
+
 ### Upgrade or downgrade
 
 For both upgrading and downgrading, you can manually download and install the signed installer package by following the steps from [initial install](#initial-install) or use the `update-container.sh` script (installed to `/usr/local/bin`).
