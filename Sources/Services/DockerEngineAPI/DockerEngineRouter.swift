@@ -39,7 +39,7 @@ struct DockerEngineRouter: Sendable {
     let log: Logger
     let runtimeState: DockerEngineRuntimeState
 
-    func handle(method: HTTPMethod, uri: String, headers: HTTPHeaders, body: Data, buildArchive: URL? = nil) async -> DockerEngineResponse {
+    func handle(method: HTTPMethod, uri: String, headers: HTTPHeaders, body: Data, archiveURL: URL? = nil) async -> DockerEngineResponse {
         guard let components = URLComponents(string: uri) else {
             return Self.error(.badRequest, "不正なリクエスト URI です")
         }
@@ -76,7 +76,7 @@ struct DockerEngineRouter: Sendable {
                 return try await listContainers(query: query)
             }
             if method == .POST && path == "/build" {
-                return try await buildImage(queryItems: components.queryItems ?? [], body: body, archiveURL: buildArchive)
+                return try await buildImage(queryItems: components.queryItems ?? [], body: body, archiveURL: archiveURL)
             }
             if method == .POST && path == "/containers/create" {
                 return try await createContainer(query: query, body: body)
@@ -87,8 +87,8 @@ struct DockerEngineRouter: Sendable {
                     return try await inspectContainer(id: id)
                 }
                 if method == .POST && pathParts[2] == "start" {
-                    try await startContainer(id: id)
-                    return DockerEngineResponse(status: .noContent)
+                    let wasRunning = try await startContainer(id: id)
+                    return DockerEngineResponse(status: wasRunning ? .notModified : .noContent)
                 }
                 if method == .POST && pathParts[2] == "stop" {
                     try await stopContainer(id: id, timeout: query["t"])
@@ -100,6 +100,25 @@ struct DockerEngineRouter: Sendable {
                 }
                 if method == .GET && pathParts[2] == "logs" {
                     return try await containerLogs(id: id, query: query)
+                }
+                if method == .PUT && pathParts[2] == "archive" {
+                    guard let archiveURL else {
+                        throw DockerAPIError.badRequest("コンテナへのコピーに archive が必要です")
+                    }
+                    try await copyArchiveIntoContainer(id: id, query: query, archiveURL: archiveURL)
+                    return DockerEngineResponse(status: .ok)
+                }
+                if method == .POST && pathParts[2] == "exec" {
+                    return try await createExec(containerID: id, body: body)
+                }
+            }
+            if pathParts.count == 3 && pathParts[0] == "exec" {
+                let id = pathParts[1]
+                if method == .POST && pathParts[2] == "start" {
+                    return try await startExec(id: id, body: body)
+                }
+                if method == .GET && pathParts[2] == "json" {
+                    return try await inspectExec(id: id)
                 }
             }
             if pathParts.count == 2 && pathParts[0] == "containers" {
@@ -118,6 +137,9 @@ struct DockerEngineRouter: Sendable {
             }
             if method == .POST && path == "/images/create" {
                 return try await pullImage(query: query, headers: headers)
+            }
+            if method == .POST && path == "/images/load" {
+                return try await loadImages(query: query, archiveURL: archiveURL)
             }
             if method == .GET && path == "/images/json" {
                 return try await listImages()
@@ -210,11 +232,15 @@ struct DockerEngineRouter: Sendable {
             snapshots = snapshots.filter { $0.status == .running }
         }
         let summaries = await snapshots.asyncMap { snapshot in
-            Self.containerSummary(
+            let imageID = (try? await ClientImage(description: snapshot.configuration.image).manifest(for: .current).config.digest)
+                ?? snapshot.configuration.image.digest
+            return Self.containerSummary(
                 snapshot,
                 health: await runtimeState.health(id: snapshot.id),
                 restartPolicy: await runtimeState.restartPolicy(id: snapshot.id),
-                restartCount: await runtimeState.restartCount(id: snapshot.id)
+                restartCount: await runtimeState.restartCount(id: snapshot.id),
+                privileged: await runtimeState.isPrivileged(id: snapshot.id),
+                imageID: imageID
             )
         }
         return try Self.json(.ok, summaries)
@@ -302,7 +328,6 @@ struct DockerEngineRouter: Sendable {
         guard rejectedMembers.isEmpty else {
             throw DockerAPIError.badRequest("build context に不正なパスが含まれています")
         }
-
         let dockerfile = query["dockerfile"] ?? "Dockerfile"
         let dockerfileURL = URL(fileURLWithPath: dockerfile, relativeTo: context).standardizedFileURL
         let contextPath = context.standardizedFileURL.path
@@ -340,21 +365,160 @@ struct DockerEngineRouter: Sendable {
         let tags = queryItems.filter { $0.name == "t" }.compactMap(\.value)
         let resultTag = tags.first ?? "apple-container-build:\(UUID().uuidString.lowercased())"
         options.targetImageNames = tags.isEmpty ? [resultTag] : tags
-        do {
-            try options.validate()
-        } catch {
-            throw DockerAPIError.badRequest("build option が不正です: \(error)")
-        }
-        try await options.runLinuxBuild(containerSystemConfig: containerSystemConfig)
+        let buildTags = options.targetImageNames
+        let buildArgs = options.buildArg
+        let buildLabels = options.label
+        let buildTarget = options.target
+        let buildNoCache = options.noCache
+        let buildPull = options.pull
+        let buildSSH = query["ssh"] ?? ""
+        let buildPlatform = query["platform"]
+        try await Task.detached(priority: .userInitiated) {
+            try await self.runBuildProcess(
+                contextPath: contextPath,
+                dockerfilePath: dockerfileURL.path,
+                tags: buildTags,
+                buildArgs: buildArgs,
+                labels: buildLabels,
+                target: buildTarget,
+                platform: buildPlatform,
+                noCache: buildNoCache,
+                pull: buildPull,
+                ssh: buildSSH
+            )
+        }.value
 
         let image = try await ClientImage.get(reference: resultTag, containerSystemConfig: containerSystemConfig)
-        let imageID = image.digest.hasPrefix("sha256:") ? image.digest : "sha256:\(image.digest)"
+        let imageID = Self.dockerImageID(try await image.manifest(for: .current).config.digest)
         let shortImageID = String(imageID.dropFirst("sha256:".count).prefix(12))
         var response = try JSONSerialization.data(withJSONObject: ["stream": "Successfully built \(shortImageID)\n"])
         response.append(0x0A)
         response.append(try JSONSerialization.data(withJSONObject: ["aux": ["ID": imageID]]))
         response.append(0x0A)
         return DockerEngineResponse(status: .ok, body: response)
+    }
+
+    private func runBuildProcess(
+        contextPath: String,
+        dockerfilePath: String,
+        tags: [String],
+        buildArgs: [String],
+        labels: [String],
+        target: String,
+        platform: String?,
+        noCache: Bool,
+        pull: Bool,
+        ssh: String
+    ) async throws {
+        let installRoot = ProcessInfo.processInfo.environment["CONTAINER_INSTALL_ROOT"]
+            ?? URL(fileURLWithPath: CommandLine.arguments[0])
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .path
+        let executableURL = URL(fileURLWithPath: installRoot).appendingPathComponent("bin/container")
+        guard FileManager.default.isExecutableFile(atPath: executableURL.path) else {
+            throw DockerAPIError.internalError("container build executable が見つかりません: \(executableURL.path)")
+        }
+
+        var arguments = ["build", "--quiet", "--progress", "plain", "--output", "type=oci"]
+        arguments.append(contentsOf: tags.flatMap { ["--tag", $0] })
+        arguments.append(contentsOf: buildArgs.flatMap { ["--build-arg", $0] })
+        arguments.append(contentsOf: labels.flatMap { ["--label", $0] })
+        if !target.isEmpty {
+            arguments.append(contentsOf: ["--target", target])
+        }
+        if let platform, !platform.isEmpty {
+            arguments.append(contentsOf: ["--platform", platform])
+        }
+        if noCache {
+            arguments.append("--no-cache")
+        }
+        if pull {
+            arguments.append("--pull")
+        }
+        if !ssh.isEmpty {
+            arguments.append(contentsOf: ["--ssh", ssh])
+        }
+        arguments.append(contentsOf: ["--file", dockerfilePath, contextPath])
+
+        let outputRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("docker-build-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputRoot, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: outputRoot) }
+        let stdoutURL = outputRoot.appendingPathComponent("stdout.log")
+        let stderrURL = outputRoot.appendingPathComponent("stderr.log")
+        guard FileManager.default.createFile(atPath: stdoutURL.path, contents: nil),
+            FileManager.default.createFile(atPath: stderrURL.path, contents: nil)
+        else {
+            throw DockerAPIError.internalError("build の出力ファイルを作成できません")
+        }
+
+        let stdout = try FileHandle(forWritingTo: stdoutURL)
+        let stderr = try FileHandle(forWritingTo: stderrURL)
+        defer {
+            try? stdout.close()
+            try? stderr.close()
+        }
+
+        let process = Process()
+        process.executableURL = executableURL
+        process.arguments = arguments
+        process.currentDirectoryURL = URL(fileURLWithPath: contextPath)
+        process.standardOutput = stdout
+        process.standardError = stderr
+        var environment = ProcessInfo.processInfo.environment
+        environment.removeValue(forKey: "XPC_SERVICE_NAME")
+        process.environment = environment
+
+        let status: Int32 = try await withCheckedThrowingContinuation { continuation in
+            process.terminationHandler = { process in
+                continuation.resume(returning: process.terminationStatus)
+            }
+            do {
+                try process.run()
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
+        try stdout.close()
+        try stderr.close()
+
+        guard status == 0 else {
+            let errorOutput = (try? String(contentsOf: stderrURL, encoding: .utf8))?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let message = errorOutput.flatMap { $0.isEmpty ? nil : $0 }
+                ?? "container build が終了コード \(status) で失敗しました"
+            throw DockerAPIError.internalError(message)
+        }
+    }
+
+    private func loadImages(query: [String: String], archiveURL: URL?) async throws -> DockerEngineResponse {
+        guard let archiveURL else {
+            throw DockerAPIError.badRequest("POST /images/load には tar archive が必要です")
+        }
+        for (name, value) in query where name != "quiet" && !value.isEmpty {
+            throw DockerAPIError.unsupported("image load option \(name) はサポートされていません")
+        }
+        let quiet = try Self.queryFlag(query["quiet"], field: "quiet")
+        let result = try await ClientImage.load(from: archiveURL.path, force: false)
+        for image in result.images {
+            try await image.unpack(platform: nil)
+        }
+        guard !result.images.isEmpty else {
+            throw DockerAPIError.badRequest("tar archive に読み込めるイメージがありません")
+        }
+        guard !quiet else {
+            return DockerEngineResponse(status: .ok)
+        }
+        let lines = try result.images.map { image in
+            try JSONSerialization.data(withJSONObject: ["stream": "Loaded image: \(image.reference)\n"])
+        }
+        var body = Data()
+        for line in lines {
+            body.append(line)
+            body.append(0x0A)
+        }
+        return DockerEngineResponse(status: .ok, body: body)
     }
 
     private static func buildOptions(_ value: String?, field: String) throws -> [String: String] {
@@ -437,7 +601,7 @@ struct DockerEngineRouter: Sendable {
         let kernel = try await ClientKernel.getDefaultKernel(for: .current)
         try await ContainerClient().create(configuration: config, options: .default, kernel: kernel)
         await runtimeState.configureHealthcheck(id: id, healthcheck: request.healthcheck, process: process)
-        await runtimeState.configureRestartPolicy(id: id, policy: restartPolicy)
+        await runtimeState.configureRestartPolicy(id: id, policy: restartPolicy, privileged: request.hostConfig?.privileged ?? false)
         return try Self.json(.created, ["Id": id, "Warnings": []] as [String: Any])
     }
 
@@ -462,6 +626,15 @@ struct DockerEngineRouter: Sendable {
             defaultMemory: containerSystemConfig.container.memory
         )
         config.readOnly = host.readonlyRootfs ?? false
+        if host.privileged == true {
+            config.capAdd = ["ALL"]
+            config.maskedPaths = []
+            config.readonlyPaths = []
+        } else {
+            let capabilities = try Parser.capabilities(capAdd: host.capAdd ?? [], capDrop: host.capDrop ?? [])
+            config.capAdd = capabilities.capAdd
+            config.capDrop = capabilities.capDrop
+        }
         if let memory = host.memory, memory > 0 {
             config.resources.memoryInBytes = UInt64(memory)
         } else if let memory = host.memory, memory < 0 {
@@ -641,7 +814,10 @@ struct DockerEngineRouter: Sendable {
         return try Parser.publishPorts(values)
     }
 
-    private func startContainer(id: String) async throws {
+    private func startContainer(id: String) async throws -> Bool {
+        if try await ContainerClient().get(id: id).status == .running {
+            return true
+        }
         await runtimeState.preventRestart(id: id)
         do {
             let process = try await ContainerClient().bootstrap(id: id, stdio: [nil, nil, nil])
@@ -650,6 +826,7 @@ struct DockerEngineRouter: Sendable {
             Task {
                 await monitorContainerExit(id: id, process: process)
             }
+            return false
         } catch {
             await runtimeState.allowRestart(id: id)
             throw error
@@ -696,9 +873,11 @@ struct DockerEngineRouter: Sendable {
         let health = await runtimeState.health(id: id)
         let restartPolicy = await runtimeState.restartPolicy(id: id)
         let restartCount = await runtimeState.restartCount(id: id)
+        let privileged = await runtimeState.isPrivileged(id: id)
+        let imageID = Self.dockerImageID(try await ClientImage(description: snapshot.configuration.image).manifest(for: .current).config.digest)
         return try Self.json(
             .ok,
-            Self.containerInspection(snapshot, runtime: runtime, healthcheck: healthcheck, health: health, restartPolicy: restartPolicy, restartCount: restartCount)
+            Self.containerInspection(snapshot, runtime: runtime, healthcheck: healthcheck, health: health, restartPolicy: restartPolicy, restartCount: restartCount, privileged: privileged, imageID: imageID)
         )
     }
 
@@ -727,6 +906,198 @@ struct DockerEngineRouter: Sendable {
             }
         }
         return DockerEngineResponse(status: .ok, body: body, contentType: "application/vnd.docker.raw-stream")
+    }
+
+    private func copyArchiveIntoContainer(id: String, query: [String: String], archiveURL: URL) async throws {
+        guard let requestedPath = query["path"], requestedPath.hasPrefix("/"), !requestedPath.contains("\0") else {
+            throw DockerAPIError.badRequest("PUT /containers/{id}/archive には絶対 path が必要です")
+        }
+
+        let destinationPath = URL(fileURLWithPath: requestedPath).standardizedFileURL.path
+        let destinationURL = URL(fileURLWithPath: destinationPath, isDirectory: true)
+        let destinationName = destinationPath == "/" ? "root" : destinationURL.lastPathComponent
+        let stagingRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("docker-engine-copyin-\(UUID().uuidString)", isDirectory: true)
+        let archiveContents = stagingRoot.appendingPathComponent(destinationName, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: archiveContents,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: stagingRoot) }
+
+        let rejectedPaths = try ArchiveReader(file: archiveURL).extractContents(to: archiveContents)
+        let rootDirectoryMarkers: Set<String> = ["", ".", "./", "/"]
+        let unsafePaths = rejectedPaths.filter { !rootDirectoryMarkers.contains($0) }
+        guard unsafePaths.isEmpty else {
+            throw DockerAPIError.badRequest("archive にコピー先から逸脱するパスがあります: \(unsafePaths.joined(separator: ", "))")
+        }
+
+        let client = ContainerClient()
+        if destinationPath != "/" {
+            let destinationParent = destinationURL.deletingLastPathComponent().path
+            try await runContainerCommand(id: id, executable: "/bin/mkdir", arguments: ["-p", "--", destinationParent])
+            try await client.copyIn(
+                id: id,
+                source: archiveContents.path,
+                destination: destinationParent,
+                createParents: true
+            )
+            return
+        }
+
+        let entries = try FileManager.default.contentsOfDirectory(
+            at: archiveContents,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: []
+        )
+        for entry in entries {
+            let attributes = try FileManager.default.attributesOfItem(atPath: entry.path)
+            let type = attributes[.type] as? FileAttributeType
+            if type == .typeDirectory {
+                try await client.copyIn(id: id, source: entry.path, destination: "/", createParents: true)
+            } else if type == .typeSymbolicLink {
+                let target = try FileManager.default.destinationOfSymbolicLink(atPath: entry.path)
+                try await runContainerCommand(id: id, executable: "/bin/ln", arguments: ["-s", "--", target, "/\(entry.lastPathComponent)"])
+            } else {
+                let mode = (attributes[.posixPermissions] as? NSNumber)?.uint32Value ?? 0o644
+                try await client.copyIn(id: id, source: entry.path, destination: "/", mode: mode, createParents: true)
+            }
+        }
+    }
+
+    private func runContainerCommand(id: String, executable: String, arguments: [String]) async throws {
+        let client = ContainerClient()
+        let container = try await client.get(id: id)
+        var configuration = container.configuration.initProcess
+        configuration.executable = executable
+        configuration.arguments = arguments
+        configuration.terminal = false
+        let process = try await client.createProcess(
+            containerId: id,
+            processId: UUID().uuidString.lowercased(),
+            configuration: configuration,
+            stdio: [nil, nil, nil]
+        )
+        try await process.start()
+        let exitCode = try await process.wait()
+        guard exitCode == 0 else {
+            throw DockerAPIError.badRequest("コンテナ内コマンドが終了コード \(exitCode) で失敗しました")
+        }
+    }
+
+    private func createExec(containerID: String, body: Data) async throws -> DockerEngineResponse {
+        let request = try JSONDecoder().decode(DockerExecCreateRequest.self, from: body)
+        guard let command = request.command, let executable = command.first, !executable.isEmpty else {
+            throw DockerAPIError.badRequest("Exec.Cmd にコマンドが必要です")
+        }
+        let client = ContainerClient()
+        let container = try await client.get(id: containerID)
+        guard container.status == .running else {
+            throw DockerAPIError.conflict("実行中のコンテナでのみ exec を作成できます")
+        }
+
+        var process = container.configuration.initProcess
+        process.executable = executable
+        process.arguments = Array(command.dropFirst())
+        process.environment.append(contentsOf: try Parser.allEnv(imageEnvs: [], envFiles: [], envs: request.environment ?? []))
+        if let workingDirectory = request.workingDirectory, !workingDirectory.isEmpty {
+            process.workingDirectory = workingDirectory
+        }
+        process.terminal = request.tty ?? false
+        let processUser = Parser.user(user: request.user, uid: nil, gid: nil, defaultUser: process.user)
+        process.user = processUser.user
+        process.supplementalGroups.append(contentsOf: processUser.groups)
+
+        let id = await runtimeState.createExec(
+            containerID: containerID,
+            process: process,
+            tty: request.tty ?? false,
+            attachStdin: request.attachStdin ?? false,
+            attachStdout: request.attachStdout ?? false,
+            attachStderr: request.attachStderr ?? false
+        )
+        return try Self.json(.created, ["Id": id, "Warnings": []] as [String: Any])
+    }
+
+    private func startExec(id: String, body: Data) async throws -> DockerEngineResponse {
+        let request = body.isEmpty ? DockerExecStartRequest() : try JSONDecoder().decode(DockerExecStartRequest.self, from: body)
+        guard let exec = await runtimeState.beginExec(id: id) else {
+            throw DockerAPIError.notFound("exec インスタンスが見つからないか、既に開始されています")
+        }
+        if request.detach == true {
+            do {
+                let stdin = exec.attachStdin ? Pipe() : nil
+                let process = try await ContainerClient().createProcess(
+                    containerId: exec.containerID,
+                    processId: UUID().uuidString.lowercased(),
+                    configuration: exec.process,
+                    stdio: [stdin?.fileHandleForReading, nil, nil]
+                )
+                try await process.start()
+                try? stdin?.fileHandleForWriting.close()
+                Task.detached { [runtimeState] in
+                    let exitCode = (try? await process.wait()) ?? 127
+                    await runtimeState.completeExec(id: id, exitCode: exitCode)
+                }
+                return DockerEngineResponse(status: .ok, contentType: "application/vnd.docker.raw-stream")
+            } catch {
+                await runtimeState.completeExec(id: id, exitCode: 127)
+                throw error
+            }
+        }
+
+        do {
+            let output = DockerEngineExecStream(
+                tty: exec.tty,
+                attachStdin: exec.attachStdin,
+                attachStdout: exec.attachStdout,
+                attachStderr: exec.attachStderr
+            )
+            let process = try await ContainerClient().createProcess(
+                containerId: exec.containerID,
+                processId: UUID().uuidString.lowercased(),
+                configuration: exec.process,
+                stdio: output.stdio
+            )
+            try await process.start()
+            output.closeOutputWriters()
+            Task.detached { [runtimeState, output] in
+                let exitCode = (try? await process.wait()) ?? 127
+                output.finish()
+                await runtimeState.completeExec(id: id, exitCode: exitCode)
+            }
+            return DockerEngineResponse(
+                status: .switchingProtocols,
+                contentType: exec.tty ? "application/vnd.docker.raw-stream" : "application/vnd.docker.multiplexed-stream",
+                execStream: output
+            )
+        } catch {
+            await runtimeState.completeExec(id: id, exitCode: 127)
+            throw error
+        }
+    }
+
+    private func inspectExec(id: String) async throws -> DockerEngineResponse {
+        guard let exec = await runtimeState.exec(id: id) else {
+            throw DockerAPIError.notFound("exec インスタンスが見つかりません")
+        }
+        return try Self.json(.ok, [
+            "ID": exec.id,
+            "ContainerID": exec.containerID,
+            "Running": exec.running,
+            "ExitCode": exec.exitCode as Any? ?? NSNull(),
+            "OpenStdin": exec.running && exec.attachStdin,
+            "OpenStdout": exec.running && exec.attachStdout,
+            "OpenStderr": exec.running && exec.attachStderr,
+            "ProcessConfig": [
+                "privileged": false,
+                "user": exec.process.user.description,
+                "tty": exec.tty,
+                "entrypoint": exec.process.executable,
+                "arguments": exec.process.arguments,
+            ],
+        ] as [String: Any])
     }
 
     private func pullImage(query: [String: String], headers: HTTPHeaders) async throws -> DockerEngineResponse {
@@ -810,17 +1181,21 @@ struct DockerEngineRouter: Sendable {
     private func listImages() async throws -> DockerEngineResponse {
         let images = try await ClientImage.list()
         let results = await images.asyncMap { image in
-            [
-                "Id": "sha256:\(image.digest.split(separator: ":").last ?? Substring(image.digest))",
+            let manifest = try? await image.manifest(for: .current)
+            let imageConfig = try? await image.config(for: .current)
+            let imageID = Self.dockerImageID(manifest?.config.digest ?? image.digest)
+            let size = manifest.map(Self.dockerImageSize) ?? image.descriptor.size
+            return [
+                "Id": imageID,
                 "ParentId": "",
                 "RepoTags": [image.reference],
                 "RepoDigests": ["\(image.reference)@\(image.digest)"],
-                "Created": 0,
-                "Size": image.descriptor.size,
+                "Created": Self.dockerImageCreated(imageConfig?.created),
+                "Size": size,
                 "SharedSize": -1,
-                "VirtualSize": image.descriptor.size,
+                "VirtualSize": size,
                 "Containers": -1,
-                "Labels": [:],
+                "Labels": imageConfig?.config?.labels ?? [:],
             ] as [String: Any]
         }
         return try Self.json(.ok, results)
@@ -828,24 +1203,48 @@ struct DockerEngineRouter: Sendable {
 
     private func inspectImage(name: String) async throws -> DockerEngineResponse {
         let image = try await ClientImage.get(reference: name, containerSystemConfig: containerSystemConfig)
-        let imageConfig = try await image.config(for: .current).config
+        let manifest = try await image.manifest(for: .current)
+        let imageConfig = try await image.config(for: .current)
+        let imageID = Self.dockerImageID(manifest.config.digest)
         return try Self.json(.ok, [
-            "Id": "sha256:\(image.digest.split(separator: ":").last ?? Substring(image.digest))",
+            "Id": imageID,
             "RepoTags": [image.reference],
             "RepoDigests": ["\(image.reference)@\(image.digest)"],
-            "Created": "1970-01-01T00:00:00Z",
-            "Size": image.descriptor.size,
-            "Architecture": Platform.current.architecture,
-            "Os": "linux",
+            "Created": Self.dockerImageCreatedString(imageConfig.created),
+            "Size": Self.dockerImageSize(manifest),
+            "Architecture": imageConfig.architecture,
+            "Os": imageConfig.os,
             "Config": [
-                "Cmd": imageConfig?.cmd ?? [],
-                "Entrypoint": imageConfig?.entrypoint ?? [],
-                "Env": imageConfig?.env ?? [],
-                "WorkingDir": imageConfig?.workingDir ?? "",
-                "User": imageConfig?.user ?? "",
-                "Labels": imageConfig?.labels ?? [:],
+                "Cmd": imageConfig.config?.cmd ?? [],
+                "Entrypoint": imageConfig.config?.entrypoint ?? [],
+                "Env": imageConfig.config?.env ?? [],
+                "WorkingDir": imageConfig.config?.workingDir ?? "",
+                "User": imageConfig.config?.user ?? "",
+                "Labels": imageConfig.config?.labels ?? [:],
             ],
+            "RootFS": ["Type": imageConfig.rootfs.type, "Layers": imageConfig.rootfs.diffIDs],
         ] as [String: Any])
+    }
+
+    private static func dockerImageID(_ digest: String) -> String {
+        digest.hasPrefix("sha256:") ? digest : "sha256:\(digest)"
+    }
+
+    private static func dockerImageSize(_ manifest: Manifest) -> Int64 {
+        ([manifest.config.size] + manifest.layers.map(\.size)).reduce(Int64(0)) { total, size in
+            let (result, overflow) = total.addingReportingOverflow(size)
+            return overflow ? Int64.max : result
+        }
+    }
+
+    private static func dockerImageCreated(_ value: String?) -> Int64 {
+        guard let date = value.flatMap(ISO8601DateFormatter().date(from:)) else { return 0 }
+        return Int64(date.timeIntervalSince1970)
+    }
+
+    private static func dockerImageCreatedString(_ value: String?) -> String {
+        guard let value, ISO8601DateFormatter().date(from: value) != nil else { return "1970-01-01T00:00:00Z" }
+        return value
     }
 
     private func createNetwork(body: Data) async throws -> DockerEngineResponse {
@@ -853,8 +1252,9 @@ struct DockerEngineRouter: Sendable {
         guard NetworkResource.nameValid(request.name) else {
             throw DockerAPIError.badRequest("ネットワーク名が正しくありません")
         }
-        guard request.driver == nil || request.driver == "bridge" || request.driver == "container-network-vmnet" else {
-            throw DockerAPIError.unsupported("Docker network driver \(request.driver ?? "") はサポートされていません")
+        let driver = request.driver.flatMap { $0.isEmpty ? nil : $0.lowercased() }
+        guard driver == nil || driver == "bridge" || driver == "container-network-vmnet" else {
+            throw DockerAPIError.unsupported("Docker network driver \(driver ?? "") はサポートされていません")
         }
         let labels = try ResourceLabels(request.labels ?? [:])
         let ipv4 = try request.ipam?.config?.first?.subnet.map { try CIDRv4($0) }
@@ -907,7 +1307,9 @@ struct DockerEngineRouter: Sendable {
         _ snapshot: ContainerSnapshot,
         health: DockerEngineHealthSnapshot?,
         restartPolicy: DockerRestartPolicy,
-        restartCount: Int
+        restartCount: Int,
+        privileged: Bool,
+        imageID: String
     ) -> [String: Any] {
         let config = snapshot.configuration
         let process = config.initProcess
@@ -917,7 +1319,7 @@ struct DockerEngineRouter: Sendable {
             "Id": snapshot.id,
             "Names": ["/\(snapshot.id)"],
             "Image": config.image.reference,
-            "ImageID": config.image.digest,
+            "ImageID": imageID,
             "Command": ([process.executable] + process.arguments).joined(separator: " "),
             "Created": Int64(config.creationDate.timeIntervalSince1970),
             "Ports": publishedPortSummary(config.publishedPorts),
@@ -928,6 +1330,7 @@ struct DockerEngineRouter: Sendable {
                 "NetworkMode": config.networks.first?.network ?? "default",
                 "Init": config.useInit,
                 "RestartPolicy": restartPolicy.dockerJSON,
+                "Privileged": privileged,
             ],
             "RestartCount": restartCount,
             "NetworkSettings": ["Networks": networkSettings(snapshot.networks, configured: config.networks, baseDomain: config.dns?.domain ?? fallbackDNSDomain)],
@@ -940,7 +1343,9 @@ struct DockerEngineRouter: Sendable {
         healthcheck: DockerHealthcheck?,
         health: DockerEngineHealthSnapshot?,
         restartPolicy: DockerRestartPolicy,
-        restartCount: Int
+        restartCount: Int,
+        privileged: Bool,
+        imageID: String
     ) -> [String: Any] {
         let config = snapshot.configuration
         let process = config.initProcess
@@ -980,7 +1385,7 @@ struct DockerEngineRouter: Sendable {
             "Path": process.executable,
             "Args": process.arguments,
             "State": state,
-            "Image": config.image.digest,
+            "Image": imageID,
             "Name": "/\(snapshot.id)",
             "RestartCount": restartCount,
             "Driver": "containerization",
@@ -996,6 +1401,7 @@ struct DockerEngineRouter: Sendable {
                 "PortBindings": publishedPortBindings(config.publishedPorts),
                 "Binds": [],
                 "RestartPolicy": restartPolicy.dockerJSON,
+                "Privileged": privileged,
             ],
             "GraphDriver": ["Name": "containerization", "Data": [:]],
             "Config": containerConfig,
@@ -1238,7 +1644,7 @@ struct DockerEngineRouter: Sendable {
 
         let supported: Set<String> = [
             "Binds", "Mounts", "PortBindings", "NetworkMode", "Memory", "NanoCpus",
-            "ReadonlyRootfs", "ShmSize", "Dns", "DnsSearch", "DnsOptions", "Sysctls", "Tmpfs", "Init", "RestartPolicy",
+            "ReadonlyRootfs", "ShmSize", "Dns", "DnsSearch", "DnsOptions", "Sysctls", "Tmpfs", "Init", "RestartPolicy", "Privileged", "CapAdd", "CapDrop",
         ]
         for (key, value) in hostConfig where !supported.contains(key) && hasNonDefaultValue(value, field: key) {
             throw DockerAPIError.unsupported("HostConfig.\(key) が指定されていますが、この API ではサポートされていません")
@@ -1407,6 +1813,34 @@ private struct DockerCreateRequest: Decodable {
     }
 }
 
+private struct DockerExecCreateRequest: Decodable {
+    let command: [String]?
+    let environment: [String]?
+    let workingDirectory: String?
+    let user: String?
+    let tty: Bool?
+    let attachStdin: Bool?
+    let attachStdout: Bool?
+    let attachStderr: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case command = "Cmd"
+        case environment = "Env"
+        case workingDirectory = "WorkingDir"
+        case user = "User"
+        case tty = "Tty"
+        case attachStdin = "AttachStdin"
+        case attachStdout = "AttachStdout"
+        case attachStderr = "AttachStderr"
+    }
+}
+
+private struct DockerExecStartRequest: Decodable {
+    let detach: Bool?
+    init(detach: Bool? = nil) { self.detach = detach }
+    enum CodingKeys: String, CodingKey { case detach = "Detach" }
+}
+
 private struct DockerHealthcheck: Decodable, Sendable {
     let test: [String]?
     let interval: Int64?
@@ -1471,6 +1905,9 @@ private struct DockerHostConfig: Decodable {
     let memory: Int64?
     let nanoCPUs: Int64?
     let readonlyRootfs: Bool?
+    let privileged: Bool?
+    let capAdd: [String]?
+    let capDrop: [String]?
     let useInit: Bool?
     let shmSize: Int64?
     let dns: [String]?
@@ -1488,6 +1925,9 @@ private struct DockerHostConfig: Decodable {
         memory = nil
         nanoCPUs = nil
         readonlyRootfs = nil
+        privileged = nil
+        capAdd = nil
+        capDrop = nil
         useInit = nil
         shmSize = nil
         dns = nil
@@ -1506,6 +1946,9 @@ private struct DockerHostConfig: Decodable {
         case memory = "Memory"
         case nanoCPUs = "NanoCpus"
         case readonlyRootfs = "ReadonlyRootfs"
+        case privileged = "Privileged"
+        case capAdd = "CapAdd"
+        case capDrop = "CapDrop"
         case useInit = "Init"
         case shmSize = "ShmSize"
         case dns = "Dns"
@@ -1663,6 +2106,18 @@ private struct DockerEngineHealthcheckConfiguration: Sendable {
     let process: ProcessConfiguration
 }
 
+private struct DockerEngineExecState: Sendable {
+    let id: String
+    let containerID: String
+    let process: ProcessConfiguration
+    let tty: Bool
+    let attachStdin: Bool
+    let attachStdout: Bool
+    let attachStderr: Bool
+    var running: Bool
+    var exitCode: Int32?
+}
+
 private enum DockerEngineHealthcheckResult: Sendable {
     case completed(Int32, String)
     case timedOut(String)
@@ -1713,7 +2168,9 @@ private final class DockerEngineHealthcheckOutput: @unchecked Sendable {
 
 actor DockerEngineRuntimeState {
     private var exits = [String: DockerEngineExitState]()
+    private var execs = [String: DockerEngineExecState]()
     private var restartPolicies = [String: DockerRestartPolicy]()
+    private var privilegedContainers = Set<String>()
     private var restartAttempts = [String: Int]()
     private var restartCounts = [String: Int]()
     private var generations = [String: Int]()
@@ -1769,12 +2226,17 @@ actor DockerEngineRuntimeState {
         exits[id]
     }
 
-    fileprivate func configureRestartPolicy(id: String, policy: DockerRestartPolicy) {
+    fileprivate func configureRestartPolicy(id: String, policy: DockerRestartPolicy, privileged: Bool) {
         generations[id, default: 0] += 1
         manuallyStopped.remove(id)
         restartAttempts[id] = 0
         restartCounts[id] = 0
         restartPolicies[id] = policy
+        if privileged {
+            privilegedContainers.insert(id)
+        } else {
+            privilegedContainers.remove(id)
+        }
     }
 
     fileprivate func restartPolicy(id: String) -> DockerRestartPolicy {
@@ -1783,6 +2245,51 @@ actor DockerEngineRuntimeState {
 
     func restartCount(id: String) -> Int {
         restartCounts[id, default: 0]
+    }
+
+    func isPrivileged(id: String) -> Bool {
+        privilegedContainers.contains(id)
+    }
+
+    func createExec(
+        containerID: String,
+        process: ProcessConfiguration,
+        tty: Bool,
+        attachStdin: Bool,
+        attachStdout: Bool,
+        attachStderr: Bool
+    ) -> String {
+        let id = UUID().uuidString.lowercased()
+        execs[id] = DockerEngineExecState(
+            id: id,
+            containerID: containerID,
+            process: process,
+            tty: tty,
+            attachStdin: attachStdin,
+            attachStdout: attachStdout,
+            attachStderr: attachStderr,
+            running: false,
+            exitCode: nil
+        )
+        return id
+    }
+
+    fileprivate func beginExec(id: String) -> DockerEngineExecState? {
+        guard var exec = execs[id], !exec.running, exec.exitCode == nil else { return nil }
+        exec.running = true
+        execs[id] = exec
+        return exec
+    }
+
+    fileprivate func exec(id: String) -> DockerEngineExecState? {
+        execs[id]
+    }
+
+    func completeExec(id: String, exitCode: Int32) {
+        guard var exec = execs[id] else { return }
+        exec.running = false
+        exec.exitCode = exitCode
+        execs[id] = exec
     }
 
     func preventRestart(id: String) {
@@ -1852,6 +2359,7 @@ actor DockerEngineRuntimeState {
         exits.removeValue(forKey: id)
         generations[id, default: 0] += 1
         restartPolicies.removeValue(forKey: id)
+        privilegedContainers.remove(id)
         restartAttempts.removeValue(forKey: id)
         restartCounts.removeValue(forKey: id)
         manuallyStopped.insert(id)

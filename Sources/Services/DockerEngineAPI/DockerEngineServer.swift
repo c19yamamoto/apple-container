@@ -21,8 +21,230 @@ import NIOCore
 import NIOHTTP1
 import NIOPosix
 
-typealias DockerHTTPConnection = NIOAsyncChannel<HTTPServerRequestPart, HTTPServerResponsePart>
+typealias DockerHTTPChannel = NIOAsyncChannel<HTTPServerRequestPart, HTTPServerResponsePart>
 typealias DockerHTTPWriter = NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>
+
+private final class DockerHTTPConnection: @unchecked Sendable {
+    static let responseEncoderName = "DockerEngineHTTPResponseEncoder"
+    static let requestDecoderName = "DockerEngineHTTPRequestDecoder"
+    static let responseValidatorName = "DockerEngineHTTPResponseValidator"
+    static let protocolErrorHandlerName = "DockerEngineHTTPProtocolErrorHandler"
+
+    let channel: Channel
+    let http: DockerHTTPChannel
+    let rawStream: DockerEngineRawStreamHandler
+
+    init(channel: Channel, http: DockerHTTPChannel, rawStream: DockerEngineRawStreamHandler) {
+        self.channel = channel
+        self.http = http
+        self.rawStream = rawStream
+    }
+
+    func prepareRawStream(_ stream: DockerEngineExecStream) async throws {
+        try await channel.pipeline.removeHandler(name: Self.requestDecoderName).get()
+        rawStream.prepare(stream)
+    }
+
+    func activateRawStream() async throws {
+        try await channel.pipeline.removeHandler(name: Self.responseEncoderName).get()
+        try await channel.pipeline.removeHandler(name: Self.responseValidatorName).get()
+        try await channel.pipeline.removeHandler(name: Self.protocolErrorHandlerName).get()
+        rawStream.activate()
+    }
+}
+
+final class DockerEngineRawStreamHandler: ChannelDuplexHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+    typealias OutboundIn = ByteBuffer
+    typealias OutboundOut = ByteBuffer
+
+    private var context: ChannelHandlerContext?
+    private var stream: DockerEngineExecStream?
+    private var isRawInput = false
+    private var isRawOutput = false
+
+    func handlerAdded(context: ChannelHandlerContext) {
+        self.context = context
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        guard isRawInput else {
+            context.fireChannelRead(data)
+            return
+        }
+        let buffer = Self.unwrapInboundIn(data)
+        stream?.receive(Data(buffer.readableBytesView))
+    }
+
+    func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+        guard isRawOutput else {
+            context.write(data, promise: promise)
+            return
+        }
+        context.write(Self.wrapOutboundOut(Self.unwrapOutboundIn(data)), promise: promise)
+    }
+
+    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        if case ChannelEvent.inputClosed = event, isRawInput {
+            stream?.closeInput()
+        }
+        context.fireUserInboundEventTriggered(event)
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        stream?.closeInput()
+        context.fireChannelInactive()
+    }
+
+    func prepare(_ stream: DockerEngineExecStream) {
+        context?.eventLoop.execute {
+            self.stream = stream
+            self.isRawInput = true
+        }
+    }
+
+    func activate() {
+        context?.eventLoop.execute {
+            self.isRawOutput = true
+            self.stream?.attach(to: self)
+        }
+    }
+
+    func send(_ data: Data) {
+        guard let eventLoop = context?.eventLoop else { return }
+        eventLoop.execute { [weak self] in
+            guard let self, let context = self.context else { return }
+            var buffer = context.channel.allocator.buffer(capacity: data.count)
+            buffer.writeBytes(data)
+            context.writeAndFlush(Self.wrapOutboundOut(buffer), promise: nil)
+        }
+    }
+
+    func close() {
+        guard let eventLoop = context?.eventLoop else { return }
+        eventLoop.execute { [weak self] in
+            self?.context?.close(promise: nil)
+        }
+    }
+}
+
+final class DockerEngineExecStream: @unchecked Sendable {
+    private static let maxOutputBytes = 8 * 1024 * 1024
+
+    private let stdinPipe: Pipe?
+    private let stdoutPipe = Pipe()
+    private let stderrPipe = Pipe()
+    private let tty: Bool
+    private let attachStdout: Bool
+    private let attachStderr: Bool
+    private let lock = NSLock()
+    private let inputQueue = DispatchQueue(label: "com.apple.container.docker-exec-stdin")
+    private var transport: DockerEngineRawStreamHandler?
+    private var capturedBytes = 0
+    private var stdoutEnded = false
+    private var stderrEnded = false
+    private var processFinished = false
+
+    init(tty: Bool, attachStdin: Bool, attachStdout: Bool, attachStderr: Bool) {
+        self.tty = tty
+        self.attachStdout = attachStdout
+        self.attachStderr = attachStderr
+        self.stdinPipe = attachStdin ? Pipe() : nil
+    }
+
+    var stdio: [FileHandle?] {
+        [
+            stdinPipe?.fileHandleForReading,
+            (attachStdout || (tty && attachStderr)) ? stdoutPipe.fileHandleForWriting : nil,
+            (!tty && attachStderr) ? stderrPipe.fileHandleForWriting : nil,
+        ]
+    }
+
+    func closeOutputWriters() {
+        try? stdoutPipe.fileHandleForWriting.close()
+        try? stderrPipe.fileHandleForWriting.close()
+    }
+
+    func attach(to transport: DockerEngineRawStreamHandler) {
+        lock.lock()
+        self.transport = transport
+        lock.unlock()
+        stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            self?.readAvailable(from: handle, streamID: 1)
+        }
+        stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            self?.readAvailable(from: handle, streamID: 2)
+        }
+    }
+
+    func receive(_ data: Data) {
+        guard let stdin = stdinPipe?.fileHandleForWriting else { return }
+        inputQueue.async {
+            try? stdin.write(contentsOf: data)
+        }
+    }
+
+    func closeInput() {
+        guard let stdin = stdinPipe?.fileHandleForWriting else { return }
+        inputQueue.async {
+            try? stdin.close()
+        }
+    }
+
+    func finish() {
+        lock.lock()
+        processFinished = true
+        lock.unlock()
+        closeOutputWriters()
+        closeInput()
+        closeTransportIfFinished()
+    }
+
+    private func readAvailable(from handle: FileHandle, streamID: UInt8) {
+        let chunk = handle.availableData
+        guard !chunk.isEmpty else {
+            handle.readabilityHandler = nil
+            lock.lock()
+            if streamID == 1 {
+                stdoutEnded = true
+            } else {
+                stderrEnded = true
+            }
+            lock.unlock()
+            closeTransportIfFinished()
+            return
+        }
+
+        lock.lock()
+        let remaining = Self.maxOutputBytes - capturedBytes
+        if remaining > 0 {
+            capturedBytes += min(chunk.count, remaining)
+        }
+        let transport = self.transport
+        lock.unlock()
+        guard remaining > 0, let transport else { return }
+        let data = Data(chunk.prefix(remaining))
+        transport.send(tty ? data : Self.multiplexed(data, streamID: streamID))
+    }
+
+    private func closeTransportIfFinished() {
+        lock.lock()
+        let shouldClose = processFinished && stdoutEnded && stderrEnded
+        let transport = self.transport
+        lock.unlock()
+        if shouldClose {
+            transport?.close()
+        }
+    }
+
+    private static func multiplexed(_ data: Data, streamID: UInt8) -> Data {
+        var frame = Data([streamID, 0, 0, 0])
+        var length = UInt32(data.count).bigEndian
+        withUnsafeBytes(of: &length) { frame.append(contentsOf: $0) }
+        frame.append(data)
+        return frame
+    }
+}
 
 private let maxDockerRequestBodyBytes = 16 * 1024 * 1024
 private let maxDockerBuildContextBytes = 1024 * 1024 * 1024
@@ -73,8 +295,30 @@ public struct DockerEngineServer: Sendable {
         let server = try await ServerBootstrap(group: NIOSingletons.posixEventLoopGroup)
             .bind(unixDomainSocketPath: socketPath, cleanupExistingSocketFile: true) { channel in
                 channel.eventLoop.makeCompletedFuture {
-                    try channel.pipeline.syncOperations.configureHTTPServerPipeline(withPipeliningAssistance: false)
-                    return try DockerHTTPConnection(wrappingChannelSynchronously: channel)
+                    let responseEncoder = HTTPResponseEncoder()
+                    let requestDecoder = ByteToMessageHandler(HTTPRequestDecoder())
+                    let responseValidator = NIOHTTPResponseHeadersValidator()
+                    let protocolErrorHandler = HTTPServerProtocolErrorHandler()
+                    let rawStream = DockerEngineRawStreamHandler()
+                    try channel.pipeline.syncOperations.addHandler(
+                        responseEncoder,
+                        name: DockerHTTPConnection.responseEncoderName
+                    )
+                    try channel.pipeline.syncOperations.addHandler(
+                        requestDecoder,
+                        name: DockerHTTPConnection.requestDecoderName
+                    )
+                    try channel.pipeline.syncOperations.addHandler(
+                        responseValidator,
+                        name: DockerHTTPConnection.responseValidatorName
+                    )
+                    try channel.pipeline.syncOperations.addHandler(
+                        protocolErrorHandler,
+                        name: DockerHTTPConnection.protocolErrorHandlerName
+                    )
+                    try channel.pipeline.syncOperations.addHandler(rawStream)
+                    let http = try DockerHTTPChannel(wrappingChannelSynchronously: channel)
+                    return DockerHTTPConnection(channel: channel, http: http, rawStream: rawStream)
                 }
             }
         guard chmod(socketPath, 0o600) == 0 else {
@@ -86,30 +330,30 @@ public struct DockerEngineServer: Sendable {
     private func serve(_ connection: DockerHTTPConnection) async {
         let router = DockerEngineRouter(containerSystemConfig: containerSystemConfig, log: log, runtimeState: runtimeState)
         do {
-            try await connection.executeThenClose { inbound, outbound in
+            try await connection.http.executeThenClose { inbound, outbound in
                 var head: HTTPRequestHead?
                 var body = Data()
                 var maxBodyBytes = maxDockerRequestBodyBytes
                 var requestBodyBytes = 0
-                var buildArchiveRoot: URL?
-                var buildArchiveURL: URL?
-                var buildArchiveHandle: FileHandle?
+                var archiveRoot: URL?
+                var archiveURL: URL?
+                var archiveHandle: FileHandle?
                 defer {
-                    try? buildArchiveHandle?.close()
-                    if let buildArchiveRoot {
-                        try? FileManager.default.removeItem(at: buildArchiveRoot)
+                    try? archiveHandle?.close()
+                    if let archiveRoot {
+                        try? FileManager.default.removeItem(at: archiveRoot)
                     }
                 }
                 for try await part in inbound {
                     switch part {
                     case .head(let requestHead):
-                        try? buildArchiveHandle?.close()
-                        buildArchiveHandle = nil
-                        if let buildArchiveRoot {
-                            try? FileManager.default.removeItem(at: buildArchiveRoot)
+                        try? archiveHandle?.close()
+                        archiveHandle = nil
+                        if let archiveRoot {
+                            try? FileManager.default.removeItem(at: archiveRoot)
                         }
-                        buildArchiveRoot = nil
-                        buildArchiveURL = nil
+                        archiveRoot = nil
+                        archiveURL = nil
                         head = requestHead
                         body.removeAll(keepingCapacity: true)
                         requestBodyBytes = 0
@@ -123,16 +367,16 @@ public struct DockerEngineServer: Sendable {
                             try await outbound.write(.head(HTTPResponseHead(version: requestHead.version, status: .continue)))
                             try await outbound.write(.end(nil))
                         }
-                        if Self.isBuildRequest(requestHead) {
+                        if Self.isArchiveRequest(requestHead) {
                             let root = FileManager.default.temporaryDirectory
-                                .appendingPathComponent("docker-engine-build-\(UUID().uuidString)", isDirectory: true)
+                                .appendingPathComponent("docker-engine-archive-\(UUID().uuidString)", isDirectory: true)
                             do {
                                 try FileManager.default.createDirectory(
                                     at: root,
                                     withIntermediateDirectories: false,
                                     attributes: [.posixPermissions: 0o700]
                                 )
-                                let archive = root.appendingPathComponent("context.tar")
+                                let archive = root.appendingPathComponent("request.tar")
                                 guard FileManager.default.createFile(
                                     atPath: archive.path,
                                     contents: nil,
@@ -140,9 +384,9 @@ public struct DockerEngineServer: Sendable {
                                 ) else {
                                     throw CocoaError(.fileWriteUnknown)
                                 }
-                                buildArchiveHandle = try FileHandle(forWritingTo: archive)
-                                buildArchiveRoot = root
-                                buildArchiveURL = archive
+                                archiveHandle = try FileHandle(forWritingTo: archive)
+                                archiveRoot = root
+                                archiveURL = archive
                             } catch {
                                 try? FileManager.default.removeItem(at: root)
                                 try await Self.write(DockerEngineResponse(status: .internalServerError), outbound: outbound)
@@ -158,9 +402,9 @@ public struct DockerEngineServer: Sendable {
                         }
                         requestBodyBytes += buffer.readableBytes
                         if let bytes = buffer.getBytes(at: buffer.readerIndex, length: buffer.readableBytes) {
-                            if let buildArchiveHandle {
+                            if let archiveHandle {
                                 do {
-                                    try buildArchiveHandle.write(contentsOf: Data(bytes))
+                                    try archiveHandle.write(contentsOf: Data(bytes))
                                 } catch {
                                     try await Self.write(DockerEngineResponse(status: .internalServerError), outbound: outbound)
                                     connection.channel.close(promise: nil)
@@ -172,25 +416,25 @@ public struct DockerEngineServer: Sendable {
                         }
                     case .end:
                         if let requestHead = head {
-                            try? buildArchiveHandle?.close()
-                            buildArchiveHandle = nil
+                            try? archiveHandle?.close()
+                            archiveHandle = nil
                             let response = await router.handle(
                                 method: requestHead.method,
                                 uri: requestHead.uri,
                                 headers: requestHead.headers,
                                 body: body,
-                                buildArchive: buildArchiveURL
+                                archiveURL: archiveURL
                             )
-                            try await Self.write(response, outbound: outbound)
+                            try await Self.write(response, outbound: outbound, connection: connection)
                         }
                         head = nil
                         body.removeAll(keepingCapacity: true)
                         requestBodyBytes = 0
-                        if let buildArchiveRoot {
-                            try? FileManager.default.removeItem(at: buildArchiveRoot)
+                        if let archiveRoot {
+                            try? FileManager.default.removeItem(at: archiveRoot)
                         }
-                        buildArchiveRoot = nil
-                        buildArchiveURL = nil
+                        archiveRoot = nil
+                        archiveURL = nil
                     }
                 }
             }
@@ -200,16 +444,20 @@ public struct DockerEngineServer: Sendable {
     }
 
     private static func maxRequestBodyBytes(for request: HTTPRequestHead) -> Int {
-        isBuildRequest(request) ? maxDockerBuildContextBytes : maxDockerRequestBodyBytes
+        isArchiveRequest(request) ? maxDockerBuildContextBytes : maxDockerRequestBodyBytes
     }
 
-    private static func isBuildRequest(_ request: HTTPRequestHead) -> Bool {
-        guard request.method == .POST, let path = URLComponents(string: request.uri)?.path else { return false }
+    private static func isArchiveRequest(_ request: HTTPRequestHead) -> Bool {
+        guard let path = URLComponents(string: request.uri)?.path else { return false }
         let parts = path.split(separator: "/")
-        let endpointParts = parts.first?.range(of: #"^v\d+\.\d+$"#, options: .regularExpression) != nil
-            ? parts.dropFirst()
-            : parts[...]
-        return endpointParts.elementsEqual(["build"])
+        let endpointParts = Array(
+            parts.first?.range(of: #"^v\d+\.\d+$"#, options: .regularExpression) != nil
+                ? parts.dropFirst()
+                : parts[...]
+        )
+        return (request.method == .POST && endpointParts.elementsEqual(["build"]))
+            || (request.method == .POST && endpointParts.elementsEqual(["images", "load"]))
+            || (request.method == .PUT && endpointParts.count == 3 && endpointParts[0] == "containers" && endpointParts[2] == "archive")
     }
 
     private static func expectsContinue(_ request: HTTPRequestHead) -> Bool {
@@ -218,16 +466,42 @@ public struct DockerEngineServer: Sendable {
         }
     }
 
-    private static func write(_ response: DockerEngineResponse, outbound: DockerHTTPWriter) async throws {
+    private static func write(
+        _ response: DockerEngineResponse,
+        outbound: DockerHTTPWriter,
+        connection: DockerHTTPConnection? = nil
+    ) async throws {
         var headers = HTTPHeaders()
-        if !response.body.isEmpty {
+        if response.status == .switchingProtocols {
+            headers.add(name: "Connection", value: "Upgrade")
+            headers.add(name: "Upgrade", value: "tcp")
             headers.add(name: "Content-Type", value: response.contentType)
+        } else {
+            if !response.body.isEmpty {
+                headers.add(name: "Content-Type", value: response.contentType)
+            }
+            headers.add(name: "Content-Length", value: "\(response.body.count)")
         }
-        headers.add(name: "Content-Length", value: "\(response.body.count)")
         headers.add(name: "API-Version", value: DockerEngineRouter.apiVersion)
         headers.add(name: "Docker-Experimental", value: "false")
+
+        if let execStream = response.execStream {
+            guard let connection else {
+                throw ChannelError.inappropriateOperationForState
+            }
+            try await connection.prepareRawStream(execStream)
+            try await outbound.write(.head(HTTPResponseHead(version: .http1_1, status: response.status, headers: headers)))
+            try await outbound.write(.end(nil))
+            try await connection.activateRawStream()
+            return
+        }
+
         try await outbound.write(.head(HTTPResponseHead(version: .http1_1, status: response.status, headers: headers)))
-        if !response.body.isEmpty {
+        if let bodyStream = response.bodyStream {
+            for await chunk in bodyStream where !chunk.isEmpty {
+                try await outbound.write(.body(.byteBuffer(ByteBuffer(data: chunk))))
+            }
+        } else if !response.body.isEmpty {
             try await outbound.write(.body(.byteBuffer(ByteBuffer(bytes: response.body))))
         }
         try await outbound.write(.end(nil))
@@ -238,10 +512,20 @@ struct DockerEngineResponse: Sendable {
     let status: HTTPResponseStatus
     let body: Data
     let contentType: String
+    let bodyStream: AsyncStream<Data>?
+    let execStream: DockerEngineExecStream?
 
-    init(status: HTTPResponseStatus, body: Data = Data(), contentType: String = "application/json") {
+    init(
+        status: HTTPResponseStatus,
+        body: Data = Data(),
+        contentType: String = "application/json",
+        bodyStream: AsyncStream<Data>? = nil,
+        execStream: DockerEngineExecStream? = nil
+    ) {
         self.status = status
         self.body = body
         self.contentType = contentType
+        self.bodyStream = bodyStream
+        self.execStream = execStream
     }
 }

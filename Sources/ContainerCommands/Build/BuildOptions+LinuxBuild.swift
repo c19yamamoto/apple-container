@@ -24,10 +24,15 @@ import Containerization
 import ContainerizationError
 import ContainerizationOCI
 import ContainerizationOS
+import Dispatch
 import Foundation
 import Logging
 import NIO
 import TerminalProgress
+
+#if canImport(Darwin)
+import Darwin
+#endif
 
 extension BuildOptions {
     /// Resolves the set of target platforms from `--platform`, the
@@ -267,17 +272,26 @@ extension BuildOptions {
                 return exp
             }
 
+            let platforms = try resolvePlatforms()
+            let (signals, signalContinuation) = AsyncStream.makeStream(of: Int32.self)
+            let signalSources: [any DispatchSourceSignal] = [SIGTERM, SIGINT, SIGUSR1, SIGUSR2].map { sig in
+                _ = Darwin.signal(sig, SIG_IGN)
+                let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
+                source.setEventHandler {
+                    signalContinuation.yield(sig)
+                }
+                source.resume()
+                return source
+            }
             try await withThrowingTaskGroup(of: Void.self) { [terminal] group in
                 defer {
                     group.cancelAll()
                 }
                 group.addTask {
-                    let handler = AsyncSignalHandler.create(notify: [SIGTERM, SIGINT, SIGUSR1, SIGUSR2])
-                    for await sig in handler.signals {
+                    for await sig in signals {
                         throw ContainerizationError(.interrupted, message: "exiting on signal \(sig)")
                     }
                 }
-                let platforms = try resolvePlatforms()
                 group.addTask {
                     [
                         terminal, buildArg, secretsData, ssh, contextDir, ignoreFileData, label, noCache, target, quiet, cacheIn, cacheOut, pull, exports, imageNames, tempURL,
@@ -375,7 +389,16 @@ extension BuildOptions {
                     print(finalMessage)
                 }
 
-                try await group.next()
+                // signal stream を閉じないと、build 完了後も task group が watcher を待つ。
+                do {
+                    try await group.next()
+                } catch {
+                    signalContinuation.finish()
+                    signalSources.forEach { $0.cancel() }
+                    throw error
+                }
+                signalContinuation.finish()
+                signalSources.forEach { $0.cancel() }
             }
         } catch {
             throw NSError(domain: "Build", code: 1, userInfo: [NSLocalizedDescriptionKey: "\(error)"])
