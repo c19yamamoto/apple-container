@@ -34,6 +34,7 @@ struct DockerEngineRouter: Sendable {
     private static let fallbackDNSDomain = "containers.internal"
     private static let hiddenContainerPlugins = [ResourcePluginValues.machine, ResourcePluginValues.cluster]
     private static let maxLogBytesPerStream: UInt64 = 8 * 1024 * 1024
+    private static let maxBuildErrorOutputBytes: UInt64 = 64 * 1024
 
     let containerSystemConfig: ContainerSystemConfig
     let log: Logger
@@ -359,7 +360,6 @@ struct DockerEngineRouter: Sendable {
         if let ssh = query["ssh"], !ssh.isEmpty {
             options.ssh = ssh
         }
-        options.quiet = true
         options.progress = .plain
         options.output = ["type=oci"]
         let tags = queryItems.filter { $0.name == "t" }.compactMap(\.value)
@@ -420,7 +420,7 @@ struct DockerEngineRouter: Sendable {
             throw DockerAPIError.internalError("container build executable が見つかりません: \(executableURL.path)")
         }
 
-        var arguments = ["build", "--quiet", "--progress", "plain", "--output", "type=oci"]
+        var arguments = ["build", "--progress", "plain", "--output", "type=oci"]
         arguments.append(contentsOf: tags.flatMap { ["--tag", $0] })
         arguments.append(contentsOf: buildArgs.flatMap { ["--build-arg", $0] })
         arguments.append(contentsOf: labels.flatMap { ["--label", $0] })
@@ -484,12 +484,26 @@ struct DockerEngineRouter: Sendable {
         try stderr.close()
 
         guard status == 0 else {
-            let errorOutput = (try? String(contentsOf: stderrURL, encoding: .utf8))?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let errorOutput = Self.buildErrorOutput(at: stderrURL)
             let message = errorOutput.flatMap { $0.isEmpty ? nil : $0 }
                 ?? "container build が終了コード \(status) で失敗しました"
             throw DockerAPIError.internalError(message)
         }
+    }
+
+    private static func buildErrorOutput(at url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let endOffset = try? handle.seekToEnd() else { return nil }
+        let startOffset = endOffset > maxBuildErrorOutputBytes ? endOffset - maxBuildErrorOutputBytes : 0
+        guard (try? handle.seek(toOffset: startOffset)) != nil,
+            let data = try? handle.readToEnd()
+        else {
+            return nil
+        }
+        let output = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !output.isEmpty else { return nil }
+        return startOffset > 0 ? "build log の末尾のみ表示しています。\n\(output)" : output
     }
 
     private func loadImages(query: [String: String], archiveURL: URL?) async throws -> DockerEngineResponse {
@@ -926,7 +940,16 @@ struct DockerEngineRouter: Sendable {
         )
         defer { try? FileManager.default.removeItem(at: stagingRoot) }
 
-        let rejectedPaths = try ArchiveReader(file: archiveURL).extractContents(to: archiveContents)
+        let rejectedPaths: [String]
+        do {
+            rejectedPaths = try ArchiveReader(file: archiveURL).extractContents(to: archiveContents)
+        } catch ContainerizationArchive.ArchiveError.failedToExtractArchive(let reason)
+            where reason == "no entries found in archive"
+        {
+            // 空の copy-in は no-op とするが、存在しない ID は通常どおり拒否する。
+            _ = try await ContainerClient().get(id: id)
+            return
+        }
         let rootDirectoryMarkers: Set<String> = ["", ".", "./", "/"]
         let unsafePaths = rejectedPaths.filter { !rootDirectoryMarkers.contains($0) }
         guard unsafePaths.isEmpty else {
